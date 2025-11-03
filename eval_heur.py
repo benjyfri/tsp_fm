@@ -143,21 +143,28 @@ def main(args):
             eval_and_store("Simulated Annealing", sa_distance)
 
             # --- Lin-Kernighan ---
-            # Lin-Kernighan implementation might be sensitive, wrap in try-except
             try:
-                _, lk_distance = solve_tsp_lin_kernighan(distance_matrix)
-                eval_and_store("Lin-Kernighan", lk_distance)
+                _, lk_distance = solve_tsp_lin_kernighan(
+                    distance_matrix,
+                    max_processing_time=5.0  # Add a 5-second timeout
+                )
+                eval_and_store("Lin-Kernighan (5s limit)", lk_distance)
             except Exception as e:
-                # Store NaN or skip if it fails on an instance
-                all_percentage_errors["Lin-Kernighan"].append(np.nan)
+                all_percentage_errors["Lin-Kernighan (5s limit)"].append(np.nan)
 
 
             # --- Record-to-Record ---
             try:
-                _, rtr_distance = solve_tsp_record_to_record(distance_matrix)
-                eval_and_store("Record-to-Record", rtr_distance)
+                # The default is 10 iterations, which is slow.
+                # Let's reduce it to 3 for a faster benchmark.
+                _, rtr_distance = solve_tsp_record_to_record(
+                    distance_matrix,
+                    iterations=3  # You can tune this number
+                )
+                # Updated name for clarity in the results
+                eval_and_store("Record-to-Record (3 iter)", rtr_distance)
             except Exception as e:
-                all_percentage_errors["Record-to-Record"].append(np.nan)
+                all_percentage_errors["Record-to-Record (3 iter)"].append(np.nan)
 
     # --- 3. Compute and print statistics ---
 
