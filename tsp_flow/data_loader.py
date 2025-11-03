@@ -3,10 +3,13 @@ import torch.utils.data
 import numpy as np
 import os
 
+import torch
+import numpy as np
+
 class PointCloudDataset(torch.utils.data.Dataset):
     """
     Loads the 'processed_tsp_dataset.pt' file.
-    Each item returns the (noisy_input, tar_circle) pair.
+    Each item returns the (noisy_input, tar_circle, total_length) tuple.
     """
     def __init__(self, data_file):
         try:
@@ -24,10 +27,15 @@ class PointCloudDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         entry = self.entries[idx]
+
         # The flow starts at 'points' (x0) and ends at 'circle' (x1)
         x0 = torch.from_numpy(entry['points'].astype(np.float32))
         x1 = torch.from_numpy(entry['circle'].astype(np.float32))
-        return x0, x1
+
+        # Get the total_length (scalar) and convert to a tensor
+        total_length = torch.tensor(entry['total_length'], dtype=torch.float32)
+
+        return x0, x1, total_length
 
 def get_loaders(data_file, batch_size, train_split_size=15000, seed=42):
     """

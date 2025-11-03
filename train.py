@@ -63,7 +63,7 @@ def main(args):
         epoch_train_loss = 0.0
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]", leave=False)
 
-        for x0, x1 in train_pbar:
+        for x0, x1, _ in train_pbar:
             x0, x1 = x0.to(device), x1.to(device)
             optimizer.zero_grad()
 
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Flow Matching for TSP")
 
     # Data Args
-    parser.add_argument('--data_path', type=str, required=True, help='Path to the processed_tsp_dataset.pt file')
+    parser.add_argument('--data_path', type=str, default="data_old_scripts/processed_tsp_dataset.pt", help='Path to the processed_tsp_dataset.pt file')
     parser.add_argument('--train_size', type=int, default=15000, help='Number of samples for the training set')
 
     # Model Args
