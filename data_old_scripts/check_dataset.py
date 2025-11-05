@@ -84,5 +84,5 @@ def plot_multiple_tsp_samples(entries, num_samples=3, point_size=60):
 
 
 # --- Example usage ---
-entries = torch.load("processed_tsp_dataset.pt", weights_only=False)
+entries = torch.load("processed_tsp_dataset_TSP50_test.pt", weights_only=False)
 plot_multiple_tsp_samples(entries, num_samples=5)
