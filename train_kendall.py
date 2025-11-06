@@ -190,7 +190,7 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
 
     # Training Args
-    parser.add_argument('--epochs', type=int, default=250, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=1024, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')

@@ -53,7 +53,10 @@ def save_animation(model, test_dataset, device, save_path, item_idx=0):
     """
     print("Running ODE solver for animation...")
     model.eval()
-    x0_sample, x1_sample, _ = test_dataset[item_idx]
+
+    # [FIXED] Unpack 4 items from the dataset (x0, x1, theta, gt_length)
+    x0_sample, x1_sample, _, _ = test_dataset[item_idx]
+
     x0_sample = x0_sample.unsqueeze(0).to(device)
     x1_sample = x1_sample.unsqueeze(0).to(device)
 
@@ -106,7 +109,9 @@ def save_grid_plot(model, test_dataset, device, num_samples, num_points, save_pa
     print(f"Running inference for {num_samples} grid samples...")
     # Create a temporary loader to get a batch
     loader = torch.utils.data.DataLoader(test_dataset, batch_size=num_samples, shuffle=True)
-    x0_viz_batch, x1_viz_batch, _ = next(iter(loader))
+
+    # [FIXED] Unpack 4 items from the loader
+    x0_viz_batch, x1_viz_batch, _, _ = next(iter(loader))
 
     t_span_viz = torch.linspace(0, 1, 2).to(device)
     x0_plots, x1_plots, pred_x1_plots = generate_plot_data(model, x0_viz_batch, x1_viz_batch, t_span_viz, device=device)

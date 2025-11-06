@@ -370,9 +370,9 @@ def quick_plot_sample(entry, show=True, ax=None):
 # ---------- Main / CLI ----------
 def main():
     parser = argparse.ArgumentParser(description="Convert TSP .txt dataset -> PyTorch dataset for flow matching.")
-    parser.add_argument('--infile', default="../tsp50_train_concorde.txt",
+    parser.add_argument('--infile', default="../tsp50_test_concorde.txt",
                         help="Path to .txt file (e.g., tsp20.txt or tsp50.txt).")
-    parser.add_argument('--out', default='processed_tsp_dataset_TSP50_train.pt',
+    parser.add_argument('--out', default='processed_tsp_dataset_TSP50_test.pt',
                         help="Output .pt file to save processed dataset.")
     # 'num_arc_segments' is no longer used but kept to avoid breaking old CLI calls
     parser.add_argument('--num-arc-segments', type=int, default=NUM_ARC_SEGMENTS,
