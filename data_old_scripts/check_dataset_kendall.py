@@ -187,7 +187,7 @@ def create_morph_animation(entry, sample_idx, out_file, duration_sec=2, fps=60, 
 
 def main():
     parser = argparse.ArgumentParser(description="Create morphing animations from a Kendall-processed TSP dataset.")
-    parser.add_argument('--infile', default="processed_tsp_dataset_TSP50_val_FULL.pt", # <-- Updated default
+    parser.add_argument('--infile', default="processed_tsp_dataset_TSP50_val.pt", # <-- Updated default
                         help="Path to the processed .pt file (Kendall format).")
     parser.add_argument('--num-samples', type=int, default=3,
                         help="Number of random samples to animate.")
