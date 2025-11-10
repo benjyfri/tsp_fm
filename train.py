@@ -257,12 +257,24 @@ def main(args):
         # [MODIFIED] Batch is now a dict, but get_flow_sample handles it.
         for batch_idx, batch in enumerate(pbar):
             optimizer.zero_grad()
+            # debug snippet (put under model.train() loop after get_flow_sample)
 
-            # get_flow_sample now handles the dict 'batch'
+
+        # get_flow_sample now handles the dict 'batch'
             t, xt, ut = get_flow_sample(batch, args.fm_method, device, cfm_obj=cfm, geo_eps=stability_eps)
 
             vt = model(xt, t)
-            loss = torch.mean((vt - ut) ** 2)
+
+            dot = torch.sum(xt * ut, dim=(1,2), keepdim=True)   # (B,1,1)
+            ut_tan = ut - dot * xt
+            dot_v = torch.sum(xt * vt, dim=(1,2), keepdim=True)
+            vt_tan = vt - dot_v * xt
+
+
+
+
+
+            loss = torch.mean((ut_tan - vt_tan) ** 2)
 
             loss.backward()
 
@@ -323,7 +335,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--log_epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--grad_clip_norm', type=float, default=1.0)
