@@ -3,16 +3,18 @@ import torch.utils.data
 import numpy as np
 import os
 
-import torch
-import numpy as np
+# [REMOVED] No longer need the 'calculate_edge_lengths_torch' helper.
 
 class PointCloudDataset(torch.utils.data.Dataset):
     """
+    [REVISED]
     Loads the processed .pt file (Kendall format).
-    Each item returns the (x0, x1, theta, gt_length) tuple.
+    Each item returns a dictionary containing all data for all FM methods.
     """
     def __init__(self, data_file):
         try:
+            # Note: weights_only=False is required because the .pt file
+            # contains NumPy arrays, not just model weights.
             self.entries = torch.load(data_file, weights_only=False)
             print(f"Successfully loaded {len(self.entries)} total data entries from {data_file}")
         except FileNotFoundError:
@@ -28,24 +30,46 @@ class PointCloudDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         entry = self.entries[idx]
 
-        # The flow starts at 'points' (x0) and ends at 'circle' (x1)
+        # --- Base data for (linear, kendall) ---
         x0 = torch.from_numpy(entry['points'].astype(np.float32))
         x1 = torch.from_numpy(entry['circle'].astype(np.float32))
-
-        # Get the theta (Procrustes distance) scalar
         theta = torch.tensor(entry['theta'], dtype=torch.float32)
 
-        # [FIXED] Add ground-truth TSP length for evaluation.
-        # Use .get() for safety, providing 0.0 as a default if 'total_length' is missing.
-        # This is required by evaluate.py but ignored by train.py.
+        # [FIXED in original script] 'total_length' is not in the new dataset
+        # We'll use 0.0 as a placeholder for gt_length if needed
         gt_length = torch.tensor(entry.get('total_length', 0.0), dtype=torch.float32)
 
-        return x0, x1, theta, gt_length
+        # --- [NEW] Data for Angle FM ---
+        path = torch.from_numpy(entry['path'].astype(np.int64))
+
+        # Angles (from original script)
+        angles_0 = torch.from_numpy(entry['turning_angles'].astype(np.float32))
+        angles_1 = torch.from_numpy(entry['circle_turning_angles'].astype(np.float32))
+
+        # [CORRECTED] Edge lengths (from original script, as you pointed out)
+        # These are the constant lengths used for the path.
+        edge_lengths = torch.from_numpy(entry['edge_lengths'].astype(np.float32))
+
+        # --- [NEW] Return a dictionary ---
+        return {
+            'x0': x0,
+            'x1': x1,
+            'theta': theta,
+            'gt_length': gt_length,
+
+            # Data for Angle FM
+            'path': path,
+            'angles_0': angles_0,
+            'angles_1': angles_1,
+            'edge_lengths': edge_lengths, # <-- Use this single, constant set of lengths
+        }
+
 
 def get_loaders(train_data_file, test_data_file, batch_size):
     """
     Creates and returns the training and test DataLoader objects
     from pre-split data files.
+    (No changes needed here, DataLoader handles dicts automatically)
     """
     try:
         # Load train_dataset from train_data_file

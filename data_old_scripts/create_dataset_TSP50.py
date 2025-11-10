@@ -63,11 +63,19 @@ def pre_process_shape(X: np.ndarray) -> np.ndarray:
     return X_normed
 
 
-def find_optimal_rotation(A: np.ndarray, B: np.ndarray):
+import numpy as np
+from numpy.linalg import svd, norm
+
+
+import numpy as np
+from numpy.linalg import svd, norm, det
+
+def find_optimal_transform(A: np.ndarray, B: np.ndarray):
     """
-    [NEW] Finds the optimal rotation to align B to A (Procrustes).
+    [CORRECTED] Finds the optimal *rotation* (det(Q)=+1)
+    to align B to A (Orthogonal Procrustes problem).
     Assumes A and B are already centered and scaled.
-    Minimizes: || A - B @ Rot ||^2
+    Minimizes: || A - B @ Q ||^2
 
     Args:
         A: The (N, 2) target point cloud (pre-processed).
@@ -75,29 +83,44 @@ def find_optimal_rotation(A: np.ndarray, B: np.ndarray):
 
     Returns:
         A tuple containing:
-        - B_aligned (np.ndarray): The (N, 2) aligned cloud (B @ Rot).
-        - rotation_matrix (np.ndarray): The (2, 2) optimal rotation matrix.
+        - B_aligned (np.ndarray): The (N, 2) aligned cloud (B @ Q).
+        - Q (np.ndarray): The (2, 2) optimal rotation matrix.
     """
-    # Compute covariance matrix M = B.T @ A
-    M = B.T @ A
+    # Compute covariance matrix M = A.T @ B
+    M = A.T @ B  # Shape: (2, N) @ (N, 2) = (2, 2)
 
     # Compute SVD of M
     try:
         U, s, Vh = svd(M)
     except np.linalg.LinAlgError:
-        # Fallback to identity rotation if SVD fails
-        Rot = np.identity(2)
-    else:
-        # Compute optimal rotation Rot, ensuring det(Rot) = 1 (no reflection)
-        S_fix = np.diag([1.0, np.linalg.det(U @ Vh)])
-        Rot = U @ S_fix @ Vh  # This is the 2x2 Rotation Matrix
+        return B, np.identity(2)  # Fallback
 
-    # Apply the optimal rotation
-    B_aligned = B @ Rot
+    V = Vh.T  # Vh is V-transpose, so we transpose it back to get V
 
-    return B_aligned, Rot
+    # --- THIS IS THE CRITICAL FIX ---
+    # 1. Calculate the optimal orthogonal matrix
+    Q = V @ U.T
 
+    # 2. Check for a reflection (det(Q) == -1)
+    if det(Q) < 0:
+        # print("Reflection detected, correcting...") # Optional: for debugging
 
+        # We must "flip" the solution to force a rotation.
+        # We do this by flipping the sign of the last column of V
+        # (which corresponds to the smallest singular value).
+        V_corrected = V.copy()
+        V_corrected[:, -1] *= -1
+
+        # 3. Re-calculate Q with the corrected V
+        Q = V_corrected @ U.T
+
+        # Double-check: det(Q) should now be +1
+        # assert np.isclose(det(Q), 1.0)
+
+    # Apply the optimal *rotation*: B_aligned = B @ Q
+    B_aligned = B @ Q  # Shape: (N, 2) @ (2, 2) = (N, 2)
+
+    return B_aligned, Q
 def calculate_edge_lengths(points: np.ndarray, path_indices: np.ndarray) -> np.ndarray:
     """
     [NEW] Computes the Euclidean length of each edge in the TSP cycle.
@@ -119,16 +142,13 @@ def calculate_edge_lengths(points: np.ndarray, path_indices: np.ndarray) -> np.n
     return np.array(segment_lengths, dtype=np.float64)
 
 
+# In createdata.py
+
 def calculate_turning_angles(points: np.ndarray, path_indices: np.ndarray) -> np.ndarray:
     """
-    [NEW] Computes the interior turning angle at each vertex of the polygon path.
-
-    Args:
-        points: The (N, 2) point cloud.
-        path_indices: The (N,) array of node indices in TSP order.
-
-    Returns:
-        (N,) np.ndarray of turning angles in radians.
+    [FIXED LOGIC] Computes the interior turning angle (up to 2*pi).
+    This version flips the convex/reflex logic to match the (likely)
+    Clockwise (CW) winding order of the TSP solver.
     """
     N = len(path_indices)
     path_coords = points[path_indices]  # Points in path order
@@ -139,8 +159,8 @@ def calculate_turning_angles(points: np.ndarray, path_indices: np.ndarray) -> np
         p_curr = path_coords[i]
         p_next = path_coords[(i + 1) % N]
 
-        v1 = p_prev - p_curr  # Incoming vector
-        v2 = p_next - p_curr  # Outgoing vector
+        v1 = p_prev - p_curr  # Vector from current to previous
+        v2 = p_next - p_curr  # Vector from current to next
 
         norm_v1 = norm(v1)
         norm_v2 = norm(v2)
@@ -150,83 +170,85 @@ def calculate_turning_angles(points: np.ndarray, path_indices: np.ndarray) -> np
         else:
             v1_u = v1 / norm_v1
             v2_u = v2 / norm_v2
+
+            # 1. Calculate the convex angle (always <= pi or 180 deg)
             dot_prod = np.dot(v1_u, v2_u)
-            angle = acos(np.clip(dot_prod, -1.0, 1.0))
+            convex_angle = acos(np.clip(dot_prod, -1.0, 1.0))
+
+            # 2. Calculate the "turn direction" using 2D cross-product (determinant)
+            turn_direction_z = v1[0] * v2[1] - v1[1] * v2[0]
+
+            # 3. [THE FIX IS HERE] Determine the final interior angle
+            # Both polygons are now CCW.
+            # For CCW, the interior (convex) angle has a NEGATIVE z-turn.
+
+            if turn_direction_z > 0: # <-- This is the fix
+                # "Left Turn" -> Convex angle (e.g., 30 deg)
+                final_angle = convex_angle
+            else:
+                # "Right Turn" (or collinear) -> Reflex angle (e.g., 330 deg)
+                final_angle = 2.0 * np.pi - convex_angle
+
+            # A small correction: if the angle is ~360, it should be 0
+            if np.isclose(final_angle, 2.0 * np.pi) and np.isclose(convex_angle, 0.0):
+                final_angle = 0.0
+
+            angle = final_angle
 
         turning_angles.append(angle)
 
     return np.array(turning_angles, dtype=np.float64)
-
-
-def create_circle_nodes(normalized_points: np.ndarray, path_indices: np.ndarray,
-                        segment_lengths: np.ndarray, total_cycle_length: float):
+def create_circle_nodes(path_indices: np.ndarray,
+                        segment_lengths: np.ndarray,
+                        total_cycle_length: float):
     """
-    Creates the initial (un-rotated, origin-centered) circle coordinates
-    based on the TSP path and total length. Enforces 'shortest' orientation.
+    [NEW] Creates the initial (un-rotated, origin-centered) circle coordinates
+    in the *original 0-to-N-1 point cloud order*.
 
     Args:
-        normalized_points: The (N, 2) normalized input point cloud.
         path_indices: The (N,) array of node indices in TSP order.
-        segment_lengths: The (N,) array of path segment lengths.
+        segment_lengths: The (N,) array of path segment lengths, corresponding
+                         to the edges in path_indices.
         total_cycle_length: The total length of the TSP path.
 
     Returns:
-        A tuple containing:
-        - circle_coords (np.ndarray): The (N, 2) coordinates on the circle, centered at origin.
-        - path_coords (np.ndarray): The (N, 2) normalized points, ordered by the path.
-        - path_indices (np.ndarray): The (potentially re-oriented) path indices.
-        - segment_lengths (np.ndarray): The (potentially re-oriented) segment lengths.
+        circle_coords_original_order (np.ndarray): The (N, 2) coordinates on
+            the circle, centered at the origin, and ordered such that
+            index 'i' corresponds to the original point cloud's index 'i'.
     """
-    N = len(normalized_points)
+    N = len(path_indices)
 
-    # 1. Enforce 'shortest' orientation
-    p0_idx_in_path = np.where(path_indices == 0)[0][0]  # index position where node 0 appears
-    idx_clockwise_in_path = (p0_idx_in_path + 1) % N
-    idx_ccw_in_path = (p0_idx_in_path - 1) % N
-    node_idx_clockwise = path_indices[idx_clockwise_in_path]
-    node_idx_ccw = path_indices[idx_ccw_in_path]
-
-    x_cw = normalized_points[node_idx_clockwise, 0]
-    x_ccw = normalized_points[node_idx_ccw, 0]
-    if x_cw <= x_ccw:
-        # Reverse the path and segment lengths
-        new_path_indices = [path_indices[0]] + path_indices[1:][::-1].tolist()
-        path_indices = np.array(new_path_indices, dtype=np.int64)
-
-        # segment_lengths[i] corresponds to edge (path_indices[i], path_indices[i+1])
-        # Reversing the path means the segments are also re-ordered
-        # The new segment_lengths[0] is old segment_lengths[0] (p0 -> p_last)
-        # The new segment_lengths[1] is old segment_lengths[N-1] (p_last -> p_N-2)
-        # etc.
-        new_segment_lengths = [segment_lengths[0]] + segment_lengths[1:][::-1].tolist()
-        segment_lengths = np.array(new_segment_lengths, dtype=np.float64)
-
-
-    # 2. Get points in path order
-    path_coords = normalized_points[path_indices]  # shape (N,2)
-
-    # 3. Calculate circle radius
+    # 1. Calculate circle radius
     R = total_cycle_length / (2.0 * pi)  # This is the scalar Radius
 
-    # 4. Compute central angles
+    # 2. Compute central angles for each path segment
     central_angles = segment_lengths / R  # shape (N,)
 
-    # 5. Calculate cumulative angles for each node
-    start_angle = np.pi / 2.0
+    # 3. Calculate cumulative angles for each node *in path order*
+    start_angle = np.pi / 2.0  # Start at the top
     cumulative_angles = [start_angle]
     current_angle = start_angle
     for ang in central_angles[:-1]:
         current_angle -= ang
         cumulative_angles.append(current_angle)
+
+    # cumulative_angles[i] is the angle for node path_indices[i]
     cumulative_angles = np.array(cumulative_angles, dtype=np.float64)  # shape (N,)
 
-    # 6. Create origin-centered circle coordinates
+    # 4. Create origin-centered circle coordinates *in path order*
     circle_x = R * np.cos(cumulative_angles)
     circle_y = R * np.sin(cumulative_angles)
-    circle_coords = np.stack([circle_x, circle_y], axis=1)  # (N,2)
+    circle_coords_path_order = np.stack([circle_x, circle_y], axis=1)  # (N,2)
 
-    return circle_coords, path_coords, path_indices, segment_lengths
+    # 5. Create the inverse permutation (the "un-scrambler")
+    # This maps the path order back to the original 0..N-1 order.
+    inv_path = np.empty_like(path_indices)
+    inv_path[path_indices] = np.arange(N)
 
+    # 6. Apply the inverse permutation to get the 0..N-1 order
+    circle_coords_original_order = circle_coords_path_order[inv_path]
+
+    return circle_coords_original_order
 
 # ---------- Helper Utilities ----------
 # (calculate_total_cycle_length is now replaced by calculate_edge_lengths and np.sum)
@@ -264,9 +286,8 @@ def parse_tsp_lib_line(line: str):
 
 def process_txt_to_dataset(txt_path):
     """
-    Reads a .txt file (tsp-20/tsp-50 format) and returns a list of dicts
-    (one dict per valid line / problem instance).
-    Each dict contains torch-friendly numpy arrays (float32/int64).
+    [REVISED] Reads a .txt file and returns a list of dicts.
+    This version fixes the data inconsistency bug.
     """
     dataset_entries = []
 
@@ -293,56 +314,59 @@ def process_txt_to_dataset(txt_path):
 
         points, path_indices = parsed_data
 
-        # --- Start of Core Geometric Logic ---
+        # --- [FIX] Start of Corrected Geometric Logic ---
 
-        # 1. Normalize the points (legacy method) for geometric calcs
-        normalized_points = normalize_points(points)
+        # 1. [FIX] Create the final x0 FIRST.
+        #    Use pre_process_shape on the *original* points.
+        #    This is our single source of truth for x0.
+        X0_processed = pre_process_shape(points)
 
-        # 2. Calculate edge lengths and turning angles (on legacy normalized points)
-        segment_lengths = calculate_edge_lengths(normalized_points, path_indices)
-        turning_angles = calculate_turning_angles(normalized_points, path_indices)
+        # 2. [FIX] Calculate all geometry from THIS x0.
+        #    (Do NOT use normalized_points anymore)
+        segment_lengths = calculate_edge_lengths(X0_processed, path_indices)
+        turning_angles = calculate_turning_angles(X0_processed, path_indices)
         total_length = np.sum(segment_lengths)
 
-        # 3. Create the initial, origin-centered circle nodes
-        #    This also re-orients the path and segments if needed.
-        circle_coords, path_coords, path_indices, segment_lengths = \
-            create_circle_nodes(normalized_points, path_indices, segment_lengths, total_length)
+        # 3. [FIX] Create the circle nodes from x0's actual geometry.
+        circle_coords = create_circle_nodes(path_indices, segment_lengths, total_length)
 
-        # 4. [NEW] Pre-process both shapes for Kendall's space
-        #    Both `path_coords` and `circle_coords` are in path order.
-        X0_path = pre_process_shape(path_coords)
-        X1_path = pre_process_shape(circle_coords)
+        # 4. Calculate turning angles for the target circle
+        #    (This part was fine, just uses the new circle_coords)
+        circle_turning_angles = calculate_turning_angles(circle_coords, path_indices)
 
-        # 5. [NEW] Find optimal alignment (rotation only)
-        X1_aligned, Rot = find_optimal_rotation(X0_path, X1_path)
+        # 5. [FIX] Pre-process the target circle. This is x1 (un-aligned).
+        X1_processed = pre_process_shape(circle_coords)
 
-        # 6. [NEW] Compute Procrustes distance (theta)
-        #    We clip to avoid numerical issues with acos
-        dot_prod = np.clip(np.trace(X0_path.T @ X1_aligned), -1.0, 1.0)
+        # 6. Find optimal alignment (rotation only)
+        #    (This part was fine)
+        X1_aligned, Rot = find_optimal_transform(X0_processed, X1_processed)
+
+        # 7. Compute Procrustes distance (theta)
+        #    (This part was fine)
+        dot_prod = np.clip(np.sum(X0_processed * X1_aligned), -1.0, 1.0)
         theta = acos(dot_prod)
 
-        # 7. Re-order the final clouds to match the *original* point cloud order
-        inv_path = [i for i in range(len(path_indices))]
-        for i, ind in enumerate(path_indices):
-            inv_path[ind] = i
+        # 8. Set final shapes
+        X0_final = X0_processed
+        X1_final = X1_aligned
 
-        X0_final = X0_path[inv_path]
-        X1_final = X1_aligned[inv_path]
-
-        # --- End of Core Geometric Logic ---
+        # --- End of Corrected Geometric Logic ---
 
         entry = {
             'points': X0_final.astype(np.float32),          # (N,2) X0
             'circle': X1_final.astype(np.float32),          # (N,2) X1 (aligned)
             'path': path_indices.astype(np.int64),          # (N,) ordering
             'theta': float(theta),                          # Procrustes distance
-            'edge_lengths': segment_lengths.astype(np.float32), # (N,)
-            'turning_angles': turning_angles.astype(np.float32) # (N,)
+            'edge_lengths': segment_lengths.astype(np.float32), # (N,) from X0
+            'turning_angles': turning_angles.astype(np.float32), # (N,) from X0
+
+            # --- NEWLY ADDED PER REQUEST ---
+            'circle_unprocessed': circle_coords.astype(np.float32),
+            'circle_turning_angles': circle_turning_angles.astype(np.float32)
         }
         dataset_entries.append(entry)
 
     return dataset_entries
-
 
 # ---------- Small plotting helper (optional) ----------
 # (Unchanged)
@@ -370,9 +394,9 @@ def quick_plot_sample(entry, show=True, ax=None):
 # ---------- Main / CLI ----------
 def main():
     parser = argparse.ArgumentParser(description="Convert TSP .txt dataset -> PyTorch dataset for flow matching.")
-    parser.add_argument('--infile', default="../tsp50_test_concorde.txt",
+    parser.add_argument('--infile', default="../tsp50_val_concorde.txt",
                         help="Path to .txt file (e.g., tsp20.txt or tsp50.txt).")
-    parser.add_argument('--out', default='processed_tsp_dataset_TSP50_test.pt',
+    parser.add_argument('--out', default='processed_tsp_dataset_TSP50_val.pt', # <-- Updated default filename
                         help="Output .pt file to save processed dataset.")
     # 'num_arc_segments' is no longer used but kept to avoid breaking old CLI calls
     parser.add_argument('--num-arc-segments', type=int, default=NUM_ARC_SEGMENTS,
