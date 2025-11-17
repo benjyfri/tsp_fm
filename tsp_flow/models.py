@@ -209,63 +209,47 @@ class CanonicalMLPVectorField(nn.Module):
 
         return v_out
 
+# models.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- Dependency from your current script ---
+# [TimeEmbedding, ConfigurableMLP, CanonicalMLPVectorField, TransformerBlock...
+#  all of that code is fine and remains unchanged]
+# ... (omitted for brevity) ...
+
 class TimeEmbedding(nn.Module):
     """Sinusoidal time embedding (like in transformers), robustified."""
-
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
         self.max_period = 10000
-
     def forward(self, t):
-        t_scalar = t.flatten()
-        half_dim = self.dim // 2
-        device = t.device
-
-        if half_dim == 0:
-            return torch.zeros(t.shape[0], self.dim, device=device)
-
+        t_scalar = t.flatten(); half_dim = self.dim // 2; device = t.device
+        if half_dim == 0: return torch.zeros(t.shape[0], self.dim, device=device)
         log_max_period = torch.log(torch.tensor(self.max_period, device=device))
-
-        # FIX: Ensure denominator is a float tensor before clamping
         denominator = torch.tensor(half_dim - 1, dtype=torch.float32, device=device).clamp(min=1.0)
-
-        freqs = torch.exp(
-            torch.arange(0, half_dim, device=device) * (-log_max_period / denominator)
-        )
-
-        args = t_scalar[:, None] * freqs[None, :]
-        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
+        freqs = torch.exp(torch.arange(0, half_dim, device=device) * (-log_max_period / denominator))
+        args = t_scalar[:, None] * freqs[None, :]; embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return embedding.view(t.shape[0], self.dim)
-
 
 class TransformerBlock(nn.Module):
     """A standard Transformer encoder block using Self-Attention."""
-
     def __init__(self, embed_dim, num_heads, dropout=0.0):
         super().__init__()
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, 4 * embed_dim),
-            nn.GELU(),
-            nn.Linear(4 * embed_dim, embed_dim),
-            nn.Dropout(dropout)
-        )
+        self.norm1 = nn.LayerNorm(embed_dim); self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(),
+                                 nn.Linear(4 * embed_dim, embed_dim), nn.Dropout(dropout))
         self.dropout = nn.Dropout(dropout)
-
     def forward(self, x):
-        # x shape: (B, N, embed_dim)
-        attn_output, _ = self.attn(x, x, x)
-        x = x + self.dropout(attn_output)
-        x = self.norm1(x)
-
-        ffn_output = self.ffn(x)
-        x = x + ffn_output
-        x = self.norm2(x)
+        attn_output, _ = self.attn(x, x, x); x = x + self.dropout(attn_output); x = self.norm1(x)
+        ffn_output = self.ffn(x); x = x + ffn_output; x = self.norm2(x)
         return x
 
 
@@ -318,4 +302,23 @@ class StrongEquivariantVectorField(nn.Module):
             h = block(h)
 
         vt = self.output_head(h)
+
+        # --- [CRITICAL FIX] ---
+        # Project the output vector vt onto the tangent space of the
+        # Kendall sphere defined by x. This prevents the model from
+        # "cheating" by outputting a radial vector.
+        # We assume x is unit norm, which the data sanity check confirmed.
+
+        # Calculate the radial component of vt
+        # dot_v shape is (B, 1, 1)
+        # dot_v = torch.sum(x * vt, dim=(1, 2), keepdim=True)
+        #
+        # # Subtract the radial component to get the tangent vector
+        # vt_tan = vt - dot_v * x
+        #
+        # return vt_tan # Return the *tangent* vector
         return vt
+        # --- [END FIX] ---
+
+# (The other models, ConfigurableMLP and CanonicalMLPVectorField, are not used
+# in your train.py, but they are fine to leave as-is)

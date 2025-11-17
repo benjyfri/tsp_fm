@@ -55,13 +55,13 @@ class PointCloudDataset(torch.utils.data.Dataset):
             'x0': x0,
             'x1': x1,
             'theta': theta,
-            'gt_length': gt_length,
+            # 'gt_length': gt_length,
 
             # Data for Angle FM
             'path': path,
-            'angles_0': angles_0,
-            'angles_1': angles_1,
-            'edge_lengths': edge_lengths, # <-- Use this single, constant set of lengths
+            # 'angles_0': angles_0,
+            # 'angles_1': angles_1,
+            # 'edge_lengths': edge_lengths, # <-- Use this single, constant set of lengths
         }
 
 
