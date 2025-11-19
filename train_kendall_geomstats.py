@@ -47,28 +47,27 @@ gs.random.seed(42)
 # ============================================================================
 
 class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding."""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
         self.max_period = 10000
+        # learnable scale to match spatial magnitude
+        self.scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, t):
-        """t: (B,) -> (B, dim)"""
         t_scalar = t.flatten()
         half_dim = self.dim // 2
         device = t.device
-
         if half_dim == 0:
             return torch.zeros(t.shape[0], self.dim, device=device)
-
         log_max_period = torch.log(torch.tensor(self.max_period, device=device, dtype=torch.float32))
         denominator = torch.tensor(half_dim - 1, dtype=torch.float32, device=device).clamp(min=1.0)
         freqs = torch.exp(torch.arange(0, half_dim, device=device, dtype=torch.float32) *
                           (-log_max_period / denominator))
         args = t_scalar[:, None] * freqs[None, :]
         embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return embedding.view(t.shape[0], self.dim)
+        return (self.scale * embedding).view(t.shape[0], self.dim)
+
 
 
 class TransformerBlock(nn.Module):
@@ -259,55 +258,66 @@ def setup_geomstats_space(n_points, ambient_dim=2):
 
 def sample_geodesic_geomstats(x0, x1, metric, device):
     """
-    Sample geodesic between x0 and x1 using geomstats (PyTorch backend).
+    Sample geodesic between aligned configurations x0 and x1.
 
-    Args:
-        x0: (B, N, 2) - start points (torch tensor)
-        x1: (B, N, 2) - end points (torch tensor)
-        metric: PreShapeMetric instance
-        device: torch device
-
-    Returns:
-        t: (B,) - random times
-        xt: (B, N, 2) - points on geodesic
-        ut: (B, N, 2) - velocities (tangent vectors)
+    Performs calculations in float64 for geometric stability,
+    but returns float32 for the neural network.
     """
-    B = x0.shape[0]
+    # 1. Upcast to double (float64) for precise geometric math
+    x0_d = x0.double()
+    x1_d = x1.double()
+    B, N, _ = x0_d.shape
 
-    # --- FIX 3 (cont.): VECTORIZED GEODESIC SAMPLING ---
-    # No more numpy conversions, all ops are torch-native
+    # 2. Sample Random Times
+    # Note: keep t as double during the calculation
+    t = torch.rand(B, device=device, dtype=torch.float64)
 
-    # Sample random times
-    t = torch.rand(B, device=device, dtype=x0.dtype)
+    # 3. Compute Log Map (Hypersphere formula for stability)
+    # We assume x0 and x1 are already aligned via Procrustes in preprocessing.
 
-    # Compute log map: tangent vector from x0 to x1
-    # log_x1_x0 has shape (B, N, 2)
-    log_x1_x0 = metric.log(x1, x0)
+    # Inner product: <x0, x1>
+    inner_prod = torch.sum(x0_d * x1_d, dim=[-2, -1])
+    # Clamp for numerical safety (acos domain)
+    cos_theta = torch.clamp(inner_prod, -1.0 + 1e-7, 1.0 - 1e-7)
+    theta = torch.acos(cos_theta)
 
-    # We need to reshape t for broadcasting: (B,) -> (B, 1, 1)
-    t_broadcast = t.view(B, 1, 1)
+    # Views for broadcasting
+    theta_view = theta.view(B, 1, 1)
+    sin_theta_view = torch.sin(theta_view)
 
-    # Geodesic segment vector from x0
-    # (B, 1, 1) * (B, N, 2) -> (B, N, 2)
-    geodesic_segment = t_broadcast * log_x1_x0
-
-    # Point on geodesic: exp(geodesic_segment) at base point x0
-    # xt shape: (B, N, 2)
-    xt = metric.exp(geodesic_segment, x0)
-
-    # Velocity: parallel transport of log_x1_x0 (the full velocity vector)
-    # along the geodesic_segment
-    # ut shape: (B, N, 2)
-    ut = metric.parallel_transport(
-        log_x1_x0,
-        x0,
-        direction=geodesic_segment
+    # Log map vector (velocity at x0)
+    # Handle limit where sin_theta -> 0 (very close points)
+    # We use a mask for stability
+    small_angle_mask = theta_view < 1e-6
+    scale_factor = torch.where(
+        small_angle_mask,
+        torch.ones_like(theta_view),
+        theta_view / sin_theta_view
     )
-    # ----------------------------------------------------
 
-    return t, xt, ut
+    # v = (x1 - x0 * cos_theta) * (theta / sin_theta)
+    log_x1_x0 = scale_factor * (x1_d - x0_d * cos_theta.view(B, 1, 1))
 
+    # 4. Geodesic Path (Exp map)
+    t_view = t.view(B, 1, 1)
 
+    # xt = x0 * cos(t*theta) + (v / theta) * sin(t*theta)
+    xt = (x0_d * torch.cos(t_view * theta_view) +
+          (log_x1_x0 / theta_view) * torch.sin(t_view * theta_view))
+
+    # For very small angles, xt is just linear interpolation roughly
+    # (This check handles NaNs if theta is exactly 0)
+    xt = torch.where(small_angle_mask, x0_d, xt)
+
+    # 5. Parallel Transport Velocity
+    # ut = -x0 * theta * sin(t*theta) + v * cos(t*theta)
+    ut = (-x0_d * theta_view * torch.sin(t_view * theta_view) +
+          log_x1_x0 * torch.cos(t_view * theta_view))
+
+    ut = torch.where(small_angle_mask, log_x1_x0, ut)
+
+    # 6. DOWNCAST to Float32 for the Neural Network
+    return t.float(), xt.float(), ut.float()
 # ============================================================================
 # Training
 # ============================================================================
@@ -420,6 +430,8 @@ def main(args):
         print("Using CPU")
         torch.set_default_device(device)
 
+    torch.set_default_dtype(torch.float32)
+
     # Create output directory
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -529,8 +541,10 @@ if __name__ == '__main__':
 
     # Data
     parser.add_argument('--train_data_path', type=str, default="data_old_scripts/processed_data_geom_train.pt",
+    # parser.add_argument('--train_data_path', type=str, default="data_old_scripts/geom_demo_train_N100.pt",
                         help="Path to training data (.pt file)")
     parser.add_argument('--test_data_path', type=str, default="data_old_scripts/processed_data_geom_val.pt",
+    # parser.add_argument('--test_data_path', type=str, default="data_old_scripts/geom_demo_val_N10.pt",
                         help="Path to test data (.pt file)")
     parser.add_argument('--num_points', type=int, default=50,
                         help="Number of points in each shape")
@@ -552,7 +566,7 @@ if __name__ == '__main__':
                         help="Number of training epochs")
     parser.add_argument('--batch_size', type=int, default=256,
                         help="Batch size")
-    parser.add_argument('--lr', type=float, default=1e-7,
+    parser.add_argument('--lr', type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument('--grad_clip_norm', type=float, default=5.0,
                         help="Gradient clipping norm")
