@@ -1,0 +1,26 @@
+program: scripts/train.py
+method: bayes
+metric:
+    name: val_loss
+    goal: minimize
+parameters:
+    interpolant:
+        values: ['kendall', 'linear', 'angle']
+    lr:
+        min: 0.0001
+        max: 0.005
+    batch_size:
+        values: [32, 64, 128]
+    embed_dim:
+        values: [64, 128, 256]
+    num_layers:
+        values: [2, 4, 6]
+command:
+    - ${env}
+    - python
+    - ${program}
+    - "--train_data"
+    - "data/processed_data_geom_train.pt"
+    - "--val_data"
+    - "data/processed_data_geom_val.pt"
+    - ${args}
