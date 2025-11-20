@@ -1,20 +1,24 @@
-program: scripts/train.py
+program: train.py
 method: bayes
 metric:
     name: val_loss
     goal: minimize
 parameters:
     interpolant:
-        values: ['kendall', 'linear', 'angle']
+        values: ['kendall']
     lr:
-        min: 0.0001
+        min: 0.00001
         max: 0.005
     batch_size:
-        values: [32, 64, 128]
+        values: [128, 256, 512, 1024]
     embed_dim:
         values: [64, 128, 256]
     num_layers:
-        values: [2, 4, 6]
+        values: [2, 4, 6, 8]
+    checkpoint_freq:
+        value: 0
+    epochs:
+        value: 20
 command:
     - ${env}
     - python
