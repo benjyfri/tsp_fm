@@ -14,7 +14,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from src.models import VectorFieldModel
+# --- CHANGED: Import RoPEVectorFieldModel as well ---
+from src.models import VectorFieldModel, RoPEVectorFieldModel
 from src.geometry import GeometryProvider
 
 # --- HELPER FUNCTIONS ---
@@ -76,6 +77,7 @@ def save_flow_animation(original_x, traj, output_file="flow_animation.gif"):
 
     ani = animation.FuncAnimation(fig, update, frames=len(traj_np),
                                   init_func=init, blit=True, interval=50)
+    # Fallback to Pillow if ffmpeg not available
     writer = animation.FFMpegWriter(fps=20) if output_file.endswith('.mp4') else animation.PillowWriter(fps=20)
     ani.save(output_file, writer=writer)
     plt.close(fig)
@@ -129,19 +131,18 @@ def plot_comparisons(original_x, traj, pred_order, model_len, gt_order, gt_len, 
 # --- MAIN ---
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/checkpoint_ep30.pt')
+    # Default path pointed to your RoPE model
+    parser.add_argument('--model_path', type=str, default='/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/kendall_ROPE_02/best_model.pt')
     parser.add_argument('--input_file', type=str, default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/processed_data_geom_val.pt')
     parser.add_argument('--gpu_id', type=int, default=5)
-    # Note: We removed the model hyperparam args from here because they are loaded from the file!
+
+    # Defaults (used only if checkpoint doesn't have config)
     parser.add_argument('--num_points', type=int, default=50)
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--t_emb_dim', type=int, default=128)
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--dropout', type=float, default=0.0)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=256)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
@@ -153,35 +154,46 @@ def main():
 
     # Check if the checkpoint contains hyperparameters
     if isinstance(checkpoint, dict) and 'args' in checkpoint:
-        print("Found hyperparameters in checkpoint. initializing model from config.")
-        # Create a Namespace from the saved dict
+        print("Found hyperparameters in checkpoint. Initializing model from config.")
         model_args = argparse.Namespace(**checkpoint['args'])
         state_dict = checkpoint['model_state_dict']
     elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        # Fallback: If user loads an OLD model without config, they might fail here unless we add the flags back.
-        # But for now, we assume the new format.
-        print("WARNING: No 'args' found in checkpoint. Please assume default params or re-train.")
+        print("WARNING: No 'args' found. Using default script arguments.")
         state_dict = checkpoint['model_state_dict']
-        model_args = args # This might fail if args doesn't have embed_dim etc.
+        model_args = args
     else:
         state_dict = checkpoint
-        print("WARNING: Raw state dict loaded. Model architecture might mismatch.")
+        print("WARNING: Raw state dict loaded. Using default script arguments.")
         model_args = args
 
-        # Initialize Geometry Provider (needs n_points)
-    # If model_args doesn't have n_points (old model), we might crash, so ensure new training script is used.
+    # B. Initialize Geometry
     n_points = getattr(model_args, 'num_points', 50)
     geo = GeometryProvider(n_points)
     interpolant_name = getattr(model_args, 'interpolant', 'kendall')
 
-    # Initialize Model
-    model = VectorFieldModel(model_args).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
+    # C. Initialize Model (Handling RoPE vs Concat)
+    model_type = getattr(model_args, 'model_type', 'concat') # Default to concat if unknown
 
+    # --- CHANGED: Logic to select the correct model architecture ---
+    if model_type == 'rope':
+        print(f"Detected Model Type: RoPE (Rotary Positional Embeddings)")
+        model = RoPEVectorFieldModel(model_args).to(device)
+    else:
+        print(f"Detected Model Type: Standard (Concatenation)")
+        model = VectorFieldModel(model_args).to(device)
+    # -------------------------------------------------------------
+
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        print(f"\nERROR Loading state dict: {e}")
+        print("Tip: If you are seeing size mismatches, ensure the training arguments (embed_dim, etc.) match exactly.")
+        sys.exit(1)
+
+    model.eval()
     print(f"Model Loaded. Architecture: {model_args.embed_dim} dim, {model_args.num_layers} layers.")
 
-    # B. Load Data & Extract GT
+    # D. Load Data & Extract GT
     gt_order = None
     gt_len = None
     x0_raw = None
@@ -189,7 +201,7 @@ def main():
     if args.input_file and os.path.exists(args.input_file):
         print(f"Loading data from {args.input_file}...")
         data_obj = torch.load(args.input_file, weights_only=False)
-        if isinstance(data_obj, list): sample = data_obj[0]
+        if isinstance(data_obj, list): sample = data_obj[1]
         else: sample = data_obj
 
         if isinstance(sample, dict):
@@ -206,16 +218,16 @@ def main():
         if x0_raw.dim() == 3: x0_raw = x0_raw[0]
         if gt_order is not None and gt_order.dim() > 1: gt_order = gt_order[0]
     else:
-        print("No input file provided. Generating random data.")
+        print("No input file provided or file not found. Generating random data.")
         x0_raw = torch.rand(n_points, 2)
 
     x0_raw = x0_raw.to(device)
 
-    # C. Calculate GT Length
+    # E. Calculate GT Length
     if gt_order is not None:
         gt_len = calculate_tour_length(x0_raw, gt_order)
 
-    # D. Inference
+    # F. Inference
     x0_norm = normalize_and_center(x0_raw)
     x0_input = x0_norm.unsqueeze(0)
 
@@ -223,7 +235,7 @@ def main():
     use_geo = geo if interpolant_name == 'kendall' else None
     traj = solve_flow(model, x0_input, geometry=use_geo, steps=100, device=device)
 
-    # E. Evaluation
+    # G. Evaluation
     x1_pred = traj[-1]
     pred_order = get_angular_order(x1_pred)
     model_len = calculate_tour_length(x0_raw, pred_order)
