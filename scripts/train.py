@@ -86,7 +86,7 @@ def train(args):
     num_params = sum(p.numel() for p in _temp_model.parameters())
     params_m = num_params / 1e6
     del _temp_model
-
+    print(f"Num of Parameters in model: {params_m:.1f}M")
     if args.run_name is None:
         args.run_name = f"{args.model_type}-{args.interpolant}-D{args.embed_dim}-L{args.num_layers}-P{params_m:.1f}M"
 
@@ -116,16 +116,27 @@ def train(args):
     interpolant = get_interpolant(config.interpolant, geo)
 
     try:
-        x0, x1, theta, _ = load_data(str(train_path), device)
-        x0_val, x1_val, theta_val, _ = load_data(str(val_path), device)
+        # Load data WITH interpolant for pre-computation
+        x0, x1, theta, _, precomputed_train = load_data(
+            str(train_path), 'cpu', interpolant=interpolant
+        )
+        x0_val, x1_val, theta_val, _, precomputed_val = load_data(
+            str(val_path), 'cpu', interpolant=interpolant
+        )
     except FileNotFoundError as e:
         print(f"\nCRITICAL ERROR: {e}")
         sys.exit(1)
 
-    train_loader = get_loader(x0, x1, theta, config.batch_size, shuffle=True)
-    val_loader = get_loader(x0_val, x1_val, theta_val, config.batch_size, shuffle=False)
+    # Tune num_workers to your machine; 4 is a good starting point.
+    train_loader = get_loader(x0, x1, theta, precomputed_train,
+                              batch_size=config.batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader = get_loader(x0_val, x1_val, theta_val, precomputed_val,
+                            batch_size=config.batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True)
 
-    # Instantiate Model
+
+# Instantiate Model
     model = get_model(config, device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -157,19 +168,36 @@ def train(args):
             for pg in optimizer.param_groups:
                 pg['lr'] = config.lr * lr_mult
 
-        for b_x0, b_x1, b_theta in pbar:
-            b_x0 = b_x0.to(device)
-            b_x1 = b_x1.to(device)
-            b_theta = b_theta.to(device)
+        for batch in pbar:
+            # Unpack batch - handle both with/without precomputed data
+            if precomputed_train is not None:
+                # First 3 are always x0, x1, theta
+                b_x0, b_x1, b_theta = batch[0], batch[1], batch[2]
+                # Rest are precomputed tensors
+                precomputed_batch = batch[3:]
+            else:
+                b_x0, b_x1, b_theta = batch
+                precomputed_batch = ()
+
+            # Move to device
+            # Move to device (non_blocking for pinned memory)
+            b_x0 = b_x0.to(device, non_blocking=True)
+            b_x1 = b_x1.to(device, non_blocking=True)
+            b_theta = b_theta.to(device, non_blocking=True)
+            # precomputed_batch contains tensors that may be double dtype.
+            # Move them with non_blocking=True as well.
+            precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
 
             optimizer.zero_grad()
 
-            # Sample Interpolant
-            t, xt, ut = interpolant.sample(b_x0, b_x1, b_theta, device)
+            # 1. Do NOT add device to the tuple
+            sample_args = (b_x0, b_x1, b_theta) + precomputed_batch
+
+            # 2. Pass device explicitly as a keyword argument
+            t, xt, ut = interpolant.sample(*sample_args, device=device)
 
             # Forward
             vt = model(xt, t, geometry=use_geo)
-
             loss = torch.mean((vt - ut) ** 2)
             loss.backward()
 
@@ -189,12 +217,28 @@ def train(args):
         val_loss_accum = 0.0
         val_batches = 0
         with torch.no_grad():
-            for b_x0, b_x1, b_theta in val_loader:
-                b_x0 = b_x0.to(device)
-                b_x1 = b_x1.to(device)
-                b_theta = b_theta.to(device)
+            for batch in val_loader:
+                if precomputed_val is not None:
+                    b_x0, b_x1, b_theta = batch[0], batch[1], batch[2]
+                    precomputed_batch = batch[3:]
+                else:
+                    b_x0, b_x1, b_theta = batch
+                    precomputed_batch = ()
 
-                t, xt, ut = interpolant.sample(b_x0, b_x1, b_theta, device)
+                # Move to device (non_blocking for pinned memory)
+                b_x0 = b_x0.to(device, non_blocking=True)
+                b_x1 = b_x1.to(device, non_blocking=True)
+                b_theta = b_theta.to(device, non_blocking=True)
+                # precomputed_batch contains tensors that may be double dtype.
+                # Move them with non_blocking=True as well.
+                precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
+
+                # 1. Do NOT add device to the tuple
+                sample_args = (b_x0, b_x1, b_theta) + precomputed_batch
+
+                # 2. Pass device explicitly as a keyword argument
+                t, xt, ut = interpolant.sample(*sample_args, device=device)
+
                 vt = model(xt, t, geometry=use_geo)
                 val_loss_accum += torch.mean((vt - ut) ** 2).item()
                 val_batches += 1

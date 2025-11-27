@@ -1,109 +1,165 @@
+# interpolants.py
 import torch
 import math
 
 class BaseInterpolant:
-    def sample(self, x0, x1, theta, device):
+    def precompute(self, x0, x1, theta):
         """
-        Returns:
-            t: (B,) time
-            xt: (B, N, 2) position at time t
-            ut: (B, N, 2) target velocity field at time t
+        Optional: Pre-compute expensive operations.
+        Returns dict of tensors to be added to dataset, or None.
+        """
+        return None
+
+    def sample(self, *args, device):
+        """
+        Sample interpolation.
+        Args will be (x0, x1, theta, device) + any precomputed tensors.
         """
         raise NotImplementedError
+
 
 class KendallInterpolant(BaseInterpolant):
     def __init__(self, geometry):
         self.geometry = geometry
 
-    def sample(self, x0, x1, theta, device):
-        # Upcast for geometric stability
+    def precompute(self, x0, x1, theta):
+        """Pre-compute geodesic components to avoid doing this every batch.
+
+        IMPORTANT: keep results in double precision and return them as double.
+        This avoids repeated float <-> double conversions in the hot training loop.
+        """
+        print("  Computing geodesics (one-time cost)...")
+
+        # Work in double for numerical stability
         x0_d = x0.double()
         x1_d = x1.double()
-        B, N, _ = x0_d.shape
 
-        t = torch.rand(B, device=device, dtype=torch.float64)
-
-        # --- Geodesic Logic (from your original script) ---
+        # inner product across points (B,)
         inner_prod = torch.sum(x0_d * x1_d, dim=[-2, -1])
+        # clamp numerical noise
         cos_theta = torch.clamp(inner_prod, -1.0 + 1e-7, 1.0 - 1e-7)
+        theta_geo = torch.acos(cos_theta)  # double
 
-        # Use pre-calculated theta if reliable, or re-calc
-        theta_geo = torch.acos(cos_theta)
+        # For stable division: compute sin(theta) view and mask small angles
+        sin_theta_view = torch.sin(theta_geo.view(-1, 1, 1))
+        small_angle_mask = (theta_geo < 1e-6)  # boolean mask, shape (B,)
+
+        # scale_factor = theta / sin(theta) except for very small angles
+        scale_factor = torch.where(
+            small_angle_mask.view(-1, 1, 1),
+            torch.ones_like(sin_theta_view),
+            theta_geo.view(-1, 1, 1) / sin_theta_view
+        )
+
+        # log map in double
+        log_x1_x0 = scale_factor * (x1_d - x0_d * cos_theta.view(-1, 1, 1))
+
+        # Return double tensors (do NOT cast to float)
+        return {
+            'theta_geo': theta_geo.float(),
+            'log_x1_x0': log_x1_x0.float(),
+            'small_angle_mask': small_angle_mask, # Bool is fine
+            'x0_fixed': x0.float()
+        }
+
+    def sample(self, x0, x1, theta, theta_geo, log_x1_x0, small_angle_mask, x0_fixed, device):
+        """
+        Pure Float32 sampling on GPU.
+        No casting, no double precision.
+        """
+        B = x0.shape[0]
+
+        # t is float32 by default
+        t = torch.rand(B, device=device)
+
+        t_view = t.view(B, 1, 1)
         theta_view = theta_geo.view(B, 1, 1)
-        sin_theta_view = torch.sin(theta_view)
 
-        # Log map
-        small_angle_mask = theta_view < 1e-6
-        scale_factor = torch.where(small_angle_mask, torch.ones_like(theta_view), theta_view / sin_theta_view)
-        log_x1_x0 = scale_factor * (x1_d - x0_d * cos_theta.view(B, 1, 1))
+        # All inputs here are already float32 because of precompute()
+        angle = t_view * theta_view
+        sin_angle = torch.sin(angle)
+        cos_angle = torch.cos(angle)
 
         # Geodesic (Exp map)
-        t_view = t.view(B, 1, 1)
-        xt = (x0_d * torch.cos(t_view * theta_view) + (log_x1_x0 / theta_view) * torch.sin(t_view * theta_view))
-        xt = torch.where(small_angle_mask, x0_d, xt)
+        # Using a small epsilon in division just in case, though mask handles it
+        xt = (x0_fixed * cos_angle +
+              (log_x1_x0 / (theta_view + 1e-8)) * sin_angle)
 
         # Parallel Transport (Velocity)
-        ut = (-x0_d * theta_view * torch.sin(t_view * theta_view) + log_x1_x0 * torch.cos(t_view * theta_view))
-        ut = torch.where(small_angle_mask, log_x1_x0, ut)
+        ut = (-x0_fixed * theta_view * sin_angle +
+              log_x1_x0 * cos_angle)
 
-        return t.float(), xt.float(), ut.float()
+        # Apply mask for small angles (Linear fallback)
+        small_mask_view = small_angle_mask.view(B, 1, 1)
+        if small_mask_view.any():
+            xt = torch.where(small_mask_view, x0_fixed, xt)
+            ut = torch.where(small_mask_view, log_x1_x0, ut)
+
+        return t, xt, ut
 
 class LinearInterpolant(BaseInterpolant):
-    """Standard Euclidean Flow Matching (Optimal Transport path)."""
+    """
+    Standard Euclidean Flow Matching.
+    No pre-computation needed - already fast!
+    """
     def sample(self, x0, x1, theta, device):
         B = x0.shape[0]
         t = torch.rand(B, device=device, dtype=torch.float32)
         t_view = t.view(B, 1, 1)
 
-        # Path: x_t = (1-t)x_0 + t x_1
-        # Velocity: u_t = x_1 - x_0
         xt = (1 - t_view) * x0 + t_view * x1
         ut = x1 - x0
 
         return t, xt, ut
 
+
 class AngleInterpolant(BaseInterpolant):
     """
-    Interpolates strictly in angular domain.
-    Assumes x0 and x1 are centered.
-    Preserves radius of x0 linearly transforming to radius of x1 (or keeping R fixed).
+    Angular interpolation.
+    Could pre-compute polar coordinates, but relatively fast as-is.
     """
-    def sample(self, x0, x1, theta, device):
-        B, N, _ = x0.shape
-        t = torch.rand(B, device=device, dtype=torch.float32)
-        t_view = t.view(B, 1, 1)
-
-        # Convert to Polar
+    def precompute(self, x0, x1, theta):
+        """Optional: pre-compute polar coordinates."""
         def to_polar(x):
             r = torch.norm(x, dim=-1, keepdim=True)
-            # atan2 returns values in [-pi, pi]
             phi = torch.atan2(x[..., 1:], x[..., 0:1])
             return r, phi
 
         r0, phi0 = to_polar(x0)
         r1, phi1 = to_polar(x1)
 
-        # Handle angular wrap-around (shortest path)
+        # Pre-compute angular differences (shortest path)
         diff = phi1 - phi0
         diff = (diff + math.pi) % (2 * math.pi) - math.pi
 
-        # Interpolate R and Phi
+        return {
+            'r0': r0,
+            'phi0': phi0,
+            'r1': r1,
+            'phi_diff': diff
+        }
+
+    def sample(self, x0, x1, theta, r0, phi0, r1, phi_diff, device):
+        """Fast sampling with pre-computed polar coordinates."""
+        B, N, _ = x0.shape
+        t = torch.rand(B, device=device, dtype=torch.float32)
+        t_view = t.view(B, 1, 1)
+
+        # Interpolate using pre-computed values
         r_t = (1 - t_view) * r0 + t_view * r1
-        phi_t = phi0 + t_view * diff
+        phi_t = phi0 + t_view * phi_diff
 
         # Convert back to Cartesian
         xt = torch.cat([r_t * torch.cos(phi_t), r_t * torch.sin(phi_t)], dim=-1)
 
-        # Velocity calculation (chain rule)
-        # dx/dt = d/dt(r_t * cos(phi_t)) = dr/dt * cos - r * sin * dphi/dt
+        # Velocity
         dr = r1 - r0
-        dphi = diff
-
-        u_x = dr * torch.cos(phi_t) - r_t * torch.sin(phi_t) * dphi
-        u_y = dr * torch.sin(phi_t) + r_t * torch.cos(phi_t) * dphi
+        u_x = dr * torch.cos(phi_t) - r_t * torch.sin(phi_t) * phi_diff
+        u_y = dr * torch.sin(phi_t) + r_t * torch.cos(phi_t) * phi_diff
         ut = torch.cat([u_x, u_y], dim=-1)
 
         return t, xt, ut
+
 
 def get_interpolant(name, geometry):
     if name == 'kendall': return KendallInterpolant(geometry)

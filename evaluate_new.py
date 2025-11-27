@@ -201,7 +201,7 @@ def main():
 
         # 1. Handle Batch/List
         if isinstance(data_obj, list):
-            sample = data_obj[1]
+            sample = data_obj[0]
             print(f"  (Loaded item 0 from list of length {len(data_obj)})")
         else:
             sample = data_obj
