@@ -117,10 +117,10 @@ def train(args):
 
     try:
         # Load data WITH interpolant for pre-computation
-        x0, x1, theta, _, precomputed_train = load_data(
+        x0, x1, _, precomputed_train = load_data(
             str(train_path), 'cpu', interpolant=interpolant
         )
-        x0_val, x1_val, theta_val, _, precomputed_val = load_data(
+        x0_val, x1_val, _, precomputed_val = load_data(
             str(val_path), 'cpu', interpolant=interpolant
         )
     except FileNotFoundError as e:
@@ -128,10 +128,10 @@ def train(args):
         sys.exit(1)
 
     # Tune num_workers to your machine; 4 is a good starting point.
-    train_loader = get_loader(x0, x1, theta, precomputed_train,
+    train_loader = get_loader(x0, x1, precomputed_train,
                               batch_size=config.batch_size, shuffle=True,
                               num_workers=4, pin_memory=True)
-    val_loader = get_loader(x0_val, x1_val, theta_val, precomputed_val,
+    val_loader = get_loader(x0_val, x1_val, precomputed_val,
                             batch_size=config.batch_size, shuffle=False,
                             num_workers=4, pin_memory=True)
 
@@ -172,18 +172,17 @@ def train(args):
             # Unpack batch - handle both with/without precomputed data
             if precomputed_train is not None:
                 # First 3 are always x0, x1, theta
-                b_x0, b_x1, b_theta = batch[0], batch[1], batch[2]
+                b_x0, b_x1 = batch[0], batch[1]
                 # Rest are precomputed tensors
-                precomputed_batch = batch[3:]
+                precomputed_batch = batch[2:]
             else:
-                b_x0, b_x1, b_theta = batch
+                b_x0, b_x1 = batch
                 precomputed_batch = ()
 
             # Move to device
             # Move to device (non_blocking for pinned memory)
             b_x0 = b_x0.to(device, non_blocking=True)
             b_x1 = b_x1.to(device, non_blocking=True)
-            b_theta = b_theta.to(device, non_blocking=True)
             # precomputed_batch contains tensors that may be double dtype.
             # Move them with non_blocking=True as well.
             precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
@@ -191,7 +190,7 @@ def train(args):
             optimizer.zero_grad()
 
             # 1. Do NOT add device to the tuple
-            sample_args = (b_x0, b_x1, b_theta) + precomputed_batch
+            sample_args = (b_x0, b_x1) + precomputed_batch
 
             # 2. Pass device explicitly as a keyword argument
             t, xt, ut = interpolant.sample(*sample_args, device=device)
@@ -219,22 +218,21 @@ def train(args):
         with torch.no_grad():
             for batch in val_loader:
                 if precomputed_val is not None:
-                    b_x0, b_x1, b_theta = batch[0], batch[1], batch[2]
-                    precomputed_batch = batch[3:]
+                    b_x0, b_x1 = batch[0], batch[1]
+                    precomputed_batch = batch[2:]
                 else:
-                    b_x0, b_x1, b_theta = batch
+                    b_x0, b_x1 = batch
                     precomputed_batch = ()
 
                 # Move to device (non_blocking for pinned memory)
                 b_x0 = b_x0.to(device, non_blocking=True)
                 b_x1 = b_x1.to(device, non_blocking=True)
-                b_theta = b_theta.to(device, non_blocking=True)
                 # precomputed_batch contains tensors that may be double dtype.
                 # Move them with non_blocking=True as well.
                 precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
 
                 # 1. Do NOT add device to the tuple
-                sample_args = (b_x0, b_x1, b_theta) + precomputed_batch
+                sample_args = (b_x0, b_x1) + precomputed_batch
 
                 # 2. Pass device explicitly as a keyword argument
                 t, xt, ut = interpolant.sample(*sample_args, device=device)
@@ -306,7 +304,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--gpu_id', type=int, default=0)
+    parser.add_argument('--gpu_id', type=int, default=7)
     parser.add_argument('--seed', type=int, default=42)
 
     args = parser.parse_args()
