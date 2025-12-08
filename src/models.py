@@ -391,3 +391,103 @@ class CanonicalRoPEVectorField(nn.Module):
         if geometry is not None:
             return geometry.to_tangent(v_global, x)
         return v_global
+
+# ... (Keep all your existing code in models.py) ...
+
+# --- 4. Regression Models (New) ---
+
+class SimpleTransformerBlock(nn.Module):
+    """
+    Standard Transformer Block without Time-conditioning (RoPE).
+    Used for direct regression.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.embed_dim)
+        # Standard PyTorch Multihead Attention
+        self.attn = nn.MultiheadAttention(
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            dropout=getattr(config, 'dropout', 0.0),
+            batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(config.embed_dim)
+        dropout = getattr(config, 'dropout', 0.0)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.embed_dim, config.embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(config.embed_dim * 4, config.embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: (B, N, C)
+        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class CanonicalRegressor(nn.Module):
+    """
+    Direct Coordinate Regression Model (x0 -> x1).
+    Uses canonicalization to ensure rotation/reflection invariance,
+    but removes Time/Flow Matching components.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.input_dim = 2
+        self.n_points = config.num_points
+        self.config = config
+
+        # Project coordinates to embedding
+        self.input_projection = nn.Sequential(
+            nn.Linear(self.input_dim, config.embed_dim),
+            nn.LayerNorm(config.embed_dim),
+            nn.GELU() # Added activation for richer feature extraction
+        )
+
+        # Backbone: Standard Transformer (No Time RoPE)
+        self.layers = nn.ModuleList([
+            SimpleTransformerBlock(config) for _ in range(config.num_layers)
+        ])
+
+        # Output Head: Predicts coordinates directly
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(config.embed_dim),
+            nn.Linear(config.embed_dim, config.embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(config.embed_dim // 2, self.input_dim)
+        )
+
+        # Initialize output to be small/close to identity behavior initially
+        nn.init.zeros_(self.output_head[-1].weight)
+        nn.init.zeros_(self.output_head[-1].bias)
+
+    def forward(self, x):
+        """
+        Input: x (Source coordinates, e.g., random points)
+        Output: y (Target coordinates, e.g., TSP solution)
+        """
+        B, N, D = x.shape
+
+        # 1. Canonicalize Input
+        # We calculate the rotation frame based on input 'x'
+        R = _get_canonical_rotation_optimized(x)
+        x_canonical = torch.bmm(x, R)
+
+        # 2. Embed
+        h = self.input_projection(x_canonical)
+
+        # 3. Transformer Processing
+        for layer in self.layers:
+            h = layer(h)
+
+        # 4. Decode to Canonical Coordinates
+        y_canonical = self.output_head(h)
+
+        # 5. Inverse Rotate (Restore Global Frame)
+        # We apply the inverse of R (R^T) to put the prediction back in original space
+        y_global = torch.bmm(y_canonical, R.transpose(1, 2))
+
+        return y_global
