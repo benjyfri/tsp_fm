@@ -7,7 +7,7 @@ from math import pi, acos
 # (I've renamed them to avoid file conflicts)
 try:
     from data_old_scripts.create_dataset_TSP50 import pre_process_shape, find_optimal_transform
-    from train import sample_geodesic_stable
+    from train_old import sample_geodesic_stable
 except ImportError:
     print("ERROR: Please save your data_create.py as 'old_data_create.py'")
     print("and your train.py as 'old_train.py' in the same directory.")

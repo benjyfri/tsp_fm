@@ -1,0 +1,54 @@
+program: train_regression.py
+method: bayes
+metric:
+    name: val_loss
+    goal: minimize
+
+# Early termination to prune bad runs
+early_terminate:
+    type: hyperband
+    min_iter: 10
+
+parameters:
+    # --- Hardware ---
+    gpu_id:
+        value: 2
+
+    # --- Hyperparameters ---
+    lr:
+        distribution: log_uniform_values
+        min: 0.00005
+        max: 0.001
+
+    batch_size:
+        values: [512,1024]
+
+    # Ensure embed_dim is divisible by num_heads
+    embed_dim:
+        values: [128, 256, 512]
+
+    num_heads:
+        values: [4, 8]
+
+    num_layers:
+        values: [4, 6, 8, 12]
+
+    dropout:
+        values: [0.0, 0.1]
+
+    weight_decay:
+        values: [0.0, 1e-5, 1e-4]
+
+    # --- Fixed Settings ---
+    epochs:
+        value: 50
+
+command:
+    - ${env}
+    - python
+    - ${program}
+    - "--train_data"
+    - "data/processed_data_geom_train.pt"
+    - "--val_data"
+    - "data/processed_data_geom_val.pt"
+    - ${args}

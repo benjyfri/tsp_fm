@@ -7,36 +7,6 @@ import torch.nn.functional as F
 
 # --- Dependency from your current script ---
 
-class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding (like in transformers), robustified."""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.max_period = 10000
-
-    def forward(self, t):
-        t_scalar = t.flatten()
-        half_dim = self.dim // 2
-        device = t.device
-
-        if half_dim == 0:
-            return torch.zeros(t.shape[0], self.dim, device=device)
-
-        log_max_period = torch.log(torch.tensor(self.max_period, device=device))
-
-        # FIX: Ensure denominator is a float tensor before clamping
-        denominator = torch.tensor(half_dim - 1, dtype=torch.float32, device=device).clamp(min=1.0)
-
-        freqs = torch.exp(
-            torch.arange(0, half_dim, device=device) * (-log_max_period / denominator)
-        )
-
-        args = t_scalar[:, None] * freqs[None, :]
-        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
-        return embedding.view(t.shape[0], self.dim)
-
 # --- Flexible MLP (Requirement 5) ---
 
 class ConfigurableMLP(nn.Module):
@@ -218,26 +188,138 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- Dependency from your current script ---
-# [TimeEmbedding, ConfigurableMLP, CanonicalMLPVectorField, TransformerBlock...
-#  all of that code is fine and remains unchanged]
-# ... (omitted for brevity) ...
-
 class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding (like in transformers), robustified."""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
         self.max_period = 10000
-    def forward(self, t):
-        t_scalar = t.flatten(); half_dim = self.dim // 2; device = t.device
-        if half_dim == 0: return torch.zeros(t.shape[0], self.dim, device=device)
-        log_max_period = torch.log(torch.tensor(self.max_period, device=device))
-        denominator = torch.tensor(half_dim - 1, dtype=torch.float32, device=device).clamp(min=1.0)
-        freqs = torch.exp(torch.arange(0, half_dim, device=device) * (-log_max_period / denominator))
-        args = t_scalar[:, None] * freqs[None, :]; embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return embedding.view(t.shape[0], self.dim)
+        # learnable scale to match spatial magnitude
+        self.scale = nn.Parameter(torch.tensor(0.1))
 
+    def forward(self, t):
+        t_scalar = t.flatten()
+        half_dim = self.dim // 2
+        device = t.device
+        if half_dim == 0:
+            return torch.zeros(t.shape[0], self.dim, device=device)
+        log_max_period = torch.log(torch.tensor(self.max_period, device=device, dtype=torch.float32))
+        denominator = torch.tensor(half_dim - 1, dtype=torch.float32, device=device).clamp(min=1.0)
+        freqs = torch.exp(torch.arange(0, half_dim, device=device, dtype=torch.float32) *
+                          (-log_max_period / denominator))
+        args = t_scalar[:, None] * freqs[None, :]
+        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return (self.scale * embedding).view(t.shape[0], self.dim)
+
+
+
+class TransformerBlock(nn.Module):
+    """Standard Transformer encoder block with self-attention."""
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """x: (B, N, embed_dim)"""
+        attn_out, _ = self.attn(x, x, x)
+        x = x + self.dropout(attn_out)
+        x = self.norm1(x)
+        ffn_out = self.ffn(x)
+        x = x + ffn_out
+        x = self.norm2(x)
+        return x
+
+
+class KendallVectorFieldModel(nn.Module):
+    """
+    Vector field model for Kendall shape space.
+
+    Key features:
+    - Outputs vectors in the tangent space to pre-shape space (sphere)
+    - Properly projects to tangent space using geomstats
+    - Permutation equivariant via Transformer
+    """
+    def __init__(self, n_points=50, embed_dim=256, t_emb_dim=128,
+                 num_layers=4, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.n_points = n_points
+        self.embed_dim = embed_dim
+        self.input_dim = 2  # 2D coordinates
+
+        # Time embedding
+        self.time_embed = TimeEmbedding(t_emb_dim)
+
+        # Input projection
+        input_feature_dim = self.input_dim + t_emb_dim
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_feature_dim, embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # Transformer blocks
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+
+        # Output head - predicts velocity in ambient space
+        self.output_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, self.input_dim)
+        )
+
+        # Zero-initialize output head
+        nn.init.zeros_(self.output_head[-1].weight)
+        nn.init.zeros_(self.output_head[-1].bias)
+
+    def forward(self, x, t, space):
+        """
+        Args:
+            x: (B, N, 2) - points on pre-shape space
+            t: (B,) - time
+            space: PreShapeSpace instance for tangent projection
+
+        Returns:
+            v_tangent: (B, N, 2) - velocity in tangent space
+        """
+        B, N, D = x.shape
+
+        # Time embedding
+        t_emb = self.time_embed(t)  # (B, t_emb_dim)
+        t_expanded = t_emb.unsqueeze(1).repeat(1, N, 1)  # (B, N, t_emb_dim)
+
+        # Concatenate coordinates with time
+        inp = torch.cat([x, t_expanded], dim=2)  # (B, N, D + t_emb_dim)
+
+        # Input projection
+        h = self.input_projection(inp)  # (B, N, embed_dim)
+
+        # Transformer blocks
+        for block in self.transformer_blocks:
+            h = block(h)
+
+        # Output head
+        v_raw = self.output_head(h)  # (B, N, 2)
+
+        # --- FIX 3: PROJECT USING PYTORCH BACKEND ---
+        # Project to tangent space using geomstats (PyTorch backend)
+        # This operation is now differentiable and stays on the device.
+        v_tangent = space.to_tangent(v_raw, x)
+        # --------------------------------------------
+
+        return v_tangent
 class TransformerBlock(nn.Module):
     """A standard Transformer encoder block using Self-Attention."""
     def __init__(self, embed_dim, num_heads, dropout=0.0):

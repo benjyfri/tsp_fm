@@ -224,16 +224,14 @@ def main(args):
             t = t.to(dtype=xt.dtype, device=xt.device).view(xt.shape[0], 1)
 
             # --- [FIX] vt is now the tangent vector vt_tan ---
-            vt_tan = model(xt, t)
+            vt = model(xt, t)
             # --- [END FIX] ---
 
             dot = torch.sum(xt * ut, dim=(1,2), keepdim=True)
             ut_tan = ut - dot * xt
 
-            # --- [FIX] REMOVED REDUNDANT PROJECTION ---
-            # dot_v = torch.sum(xt * vt, dim=(1,2), keepdim=True)
-            # vt_tan = vt - dot_v * xt
-            # --- [END FIX] ---
+            dot_v = torch.sum(xt * vt, dim=(1,2), keepdim=True)
+            vt_tan = vt - dot_v * xt
 
             # [KENDALL DEBUG]
             if args.fm_method == 'kendall' and batch_idx == 0:

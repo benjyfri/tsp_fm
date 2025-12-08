@@ -7,14 +7,14 @@ metric:
 # Early termination to save resources
 early_terminate:
     type: hyperband
-    min_iter: 20
+    min_iter: 5
 
 parameters:
     # --- Architecture Selection ---
     model_type:
         value: canonical_rope
     interpolant:
-        value: kendall
+        value: linear
 
     # --- Hardware ---
     gpu_id:
@@ -23,10 +23,10 @@ parameters:
     # --- Hyperparameters ---
     lr:
         distribution: log_uniform_values
-        min: 0.000001
-        max: 0.0001
+        min: 0.00001
+        max: 0.001
     batch_size:
-        values: [1024]
+        values: [512]
     embed_dim:
         values: [512]
 
@@ -36,13 +36,13 @@ parameters:
         values: [8,16]
 
     num_layers:
-        values: [6, 8, 10, 12,14,16]
+        values: [6, 8, 16]
 
     # --- Fixed Training settings ---
     checkpoint_freq:
         value: 0
     epochs:
-        value: 50
+        value: 20
 
 command:
     - ${env}
