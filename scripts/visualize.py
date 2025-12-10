@@ -24,7 +24,11 @@ from src.models import (
     VectorFieldModel,
     RoPEVectorFieldModel,
     CanonicalRoPEVectorField,
-    CanonicalMLPVectorField
+    CanonicalMLPVectorField,
+    # --- NEW IMPORTS ---
+    CanonicalRegressor,
+    SpectralCanonMLP,
+    SpectralCanonTransformer
 )
 from src.geometry import GeometryProvider
 from src.dataset import load_data
@@ -634,10 +638,10 @@ def main():
     parser = argparse.ArgumentParser()
 
     # Defaults tailored to user script
-    # parser.add_argument('--model_path', type=str,
-    #                     default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/canonical_rope_01/best_model.pt")
     parser.add_argument('--model_path', type=str,
-                        default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/canonical_rope_01/best_model.pt")
+                        default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/canonical_rope-kendall_sfm-D512-L20-P63.2M/final_model.pt")
+    # parser.add_argument('--model_path', type=str,
+    #                     default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/canonical_rope_linear_02/best_model.pt")
     parser.add_argument('--input_file', type=str,
                         default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/processed_data_geom_val.pt')
     parser.add_argument('--gpu_id', type=int, default=4)
@@ -675,7 +679,7 @@ def main():
     interpolant_name = getattr(model_args, 'interpolant', args.interpolant)
 
     geo = None
-    if interpolant_name == 'kendall':
+    if 'kendall' in interpolant_name:
         geo = GeometryProvider(n_points)
 
     model_type = getattr(model_args, 'model_type', 'concat')
@@ -687,6 +691,13 @@ def main():
         model = CanonicalRoPEVectorField(model_args).to(device)
     elif model_type == 'canonical_mlp':
         model = CanonicalMLPVectorField(model_args).to(device)
+        # --- NEW MODELS ---
+    elif model_type == 'canonical_regressor':
+        model = CanonicalRegressor(model_args).to(device)
+    elif model_type == 'spectral_mlp':
+        model = SpectralCanonMLP(model_args).to(device)
+    elif model_type == 'spectral_trans':
+        model = SpectralCanonTransformer(model_args).to(device)
     else:
         model = VectorFieldModel(model_args).to(device)
 
@@ -729,9 +740,9 @@ def main():
     # Inference (Standard)
     print(f"Running flow generation...")
     x0_input = x0_raw.unsqueeze(0).to(device)
-    use_geo = geo if interpolant_name == 'kendall' else None
+    use_geo = geo if ('kendall' in interpolant_name) else None
 
-    traj = get_trajectory(model, x0_input, geometry=use_geo, steps=40, device=device)
+    traj = get_trajectory(model, x0_input, geometry=use_geo, steps=5, device=device)
     final_config = traj[-1].squeeze(0)
 
     # Metrics
@@ -757,7 +768,7 @@ def main():
 
     # Standard plots (Using uniform target as the reference for 'accuracy' to model training)
     plot_comparisons(x0_raw, traj, x1_target_uniform, pred_tour, model_len, gt_path, gt_len, plot_path)
-    # animate_geodesic_diff(traj, x1_target_uniform, gt_path, anim_path)
+    animate_geodesic_diff(traj, x1_target_uniform, gt_path, anim_path)
     # animate_alternative_paths(x0_raw, x1_target_uniform, gt_path, paths_path)
 
     # --- NEW: Run Super GT Comparison ---
@@ -766,7 +777,7 @@ def main():
 
     # --- NEW: Run Drift/Sensitivity Analysis ---
     # Compare Clean Inference vs Noisy Inference
-    animate_model_sensitivity(model, x0_raw, use_geo, gt_path, sensitivity_path, noise_scale=0.005, device=device)
+    # animate_model_sensitivity(model, x0_raw, use_geo, gt_path, sensitivity_path, noise_scale=0.005, device=device)
 
 
 if __name__ == "__main__":

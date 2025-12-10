@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Revised train.py with support for Canonical models.
+Revised train.py with support for Canonical models and SFM.
 """
 
 import os
+
 # --- MUST set geomstats backend before any geomstats import ---
 os.environ['GEOMSTATS_BACKEND'] = 'pytorch'
 # ----------------------------------------------------------------
@@ -30,7 +31,10 @@ from src.models import (
     VectorFieldModel,
     RoPEVectorFieldModel,
     CanonicalMLPVectorField,
-    CanonicalRoPEVectorField
+    CanonicalRoPEVectorField,
+    CanonicalRegressor,
+    SpectralCanonMLP,
+    SpectralCanonTransformer
 )
 from src.dataset import load_data, get_loader
 
@@ -38,6 +42,7 @@ try:
     import geomstats.backend as gs
 except Exception:
     gs = None
+
 
 def save_checkpoint(path, model, optimizer=None, scheduler=None, epoch=None, args=None, best=False):
     payload = {
@@ -56,6 +61,7 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, epoch=None, arg
         best_path = str(Path(path).with_name(Path(path).stem + "_best.pt"))
         torch.save(payload, best_path)
 
+
 def get_model(args, device):
     """Helper to instantiate the correct model based on args.model_type"""
     if args.model_type == 'rope':
@@ -67,9 +73,20 @@ def get_model(args, device):
     elif args.model_type == 'canonical_mlp':
         print("Initializing Canonical MLP Vector Field Model...")
         return CanonicalMLPVectorField(args).to(device)
+    # --- NEW MODELS ---
+    elif args.model_type == 'canonical_regressor':
+        print("Initializing Canonical Regressor (Direct x0->x1)...")
+        return CanonicalRegressor(args).to(device)
+    elif args.model_type == 'spectral_mlp':
+        print("Initializing Spectral Canonical MLP...")
+        return SpectralCanonMLP(args).to(device)
+    elif args.model_type == 'spectral_trans':
+        print("Initializing Spectral Canonical Transformer...")
+        return SpectralCanonTransformer(args).to(device)
     else:
         print("Initializing Standard Concatenation Vector Field Model...")
         return VectorFieldModel(args).to(device)
+
 
 def train(args):
     torch.manual_seed(args.seed)
@@ -113,7 +130,13 @@ def train(args):
 
     # Geometry & Data
     geo = GeometryProvider(config.num_points)
-    interpolant = get_interpolant(config.interpolant, geo)
+
+    # Pass stochasticity scale to get_interpolant
+    interpolant = get_interpolant(
+        config.interpolant,
+        geo,
+        stochasticity_scale=config.stochasticity_scale
+    )
 
     try:
         # Load data WITH interpolant for pre-computation
@@ -135,8 +158,7 @@ def train(args):
                             batch_size=config.batch_size, shuffle=False,
                             num_workers=4, pin_memory=True)
 
-
-# Instantiate Model
+    # Instantiate Model
     model = get_model(config, device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -147,10 +169,9 @@ def train(args):
     )
 
     best_val = float('inf')
-    history = {'train_loss': [], 'val_loss': [], 'lr': []}
 
-    # Pass geometry if using Kendall interpolant
-    use_geo = geo if config.interpolant == 'kendall' else None
+    # Pass geometry if using Kendall interpolant or its SFM variant
+    use_geo = geo if 'kendall' in config.interpolant else None
 
     warmup_steps = int(config.warmup_epochs)
 
@@ -171,28 +192,23 @@ def train(args):
         for batch in pbar:
             # Unpack batch - handle both with/without precomputed data
             if precomputed_train is not None:
-                # First 3 are always x0, x1, theta
+                # First 3 are always x0, x1, theta (theta is inside precomputed usually, check load_data return)
+                # Actually Dataset returns (x0, x1, *precomputed_tuple)
                 b_x0, b_x1 = batch[0], batch[1]
-                # Rest are precomputed tensors
                 precomputed_batch = batch[2:]
             else:
                 b_x0, b_x1 = batch
                 precomputed_batch = ()
 
             # Move to device
-            # Move to device (non_blocking for pinned memory)
             b_x0 = b_x0.to(device, non_blocking=True)
             b_x1 = b_x1.to(device, non_blocking=True)
-            # precomputed_batch contains tensors that may be double dtype.
-            # Move them with non_blocking=True as well.
             precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
 
             optimizer.zero_grad()
 
-            # 1. Do NOT add device to the tuple
             sample_args = (b_x0, b_x1) + precomputed_batch
 
-            # 2. Pass device explicitly as a keyword argument
             t, xt, ut = interpolant.sample(*sample_args, device=device)
 
             # Forward
@@ -224,17 +240,12 @@ def train(args):
                     b_x0, b_x1 = batch
                     precomputed_batch = ()
 
-                # Move to device (non_blocking for pinned memory)
                 b_x0 = b_x0.to(device, non_blocking=True)
                 b_x1 = b_x1.to(device, non_blocking=True)
-                # precomputed_batch contains tensors that may be double dtype.
-                # Move them with non_blocking=True as well.
                 precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
 
-                # 1. Do NOT add device to the tuple
                 sample_args = (b_x0, b_x1) + precomputed_batch
 
-                # 2. Pass device explicitly as a keyword argument
                 t, xt, ut = interpolant.sample(*sample_args, device=device)
 
                 vt = model(xt, t, geometry=use_geo)
@@ -279,11 +290,20 @@ if __name__ == "__main__":
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--train_data', type=str, required=True)
     parser.add_argument('--val_data', type=str, required=True)
-    parser.add_argument('--interpolant', type=str, choices=['kendall', 'linear', 'angle'], default='kendall')
+
+    # Updated choices including kendall_sfm
+    parser.add_argument('--interpolant', type=str,
+                        choices=['kendall', 'linear', 'angle', 'kendall_sfm', 'withguard_kendall'],
+                        default='kendall')
+
+    # New argument for stochasticity
+    parser.add_argument('--stochasticity_scale', type=float, default=0.1,
+                        help="Scale of noise (g) for stochastic flow matching")
 
     # Updated Model Choices
     parser.add_argument('--model_type', type=str, default='rope',
-                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope'],
+                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope',
+                                 'canonical_regressor', 'spectral_mlp', 'spectral_trans'],
                         help="Choose model architecture")
 
     parser.add_argument('--save_dir', type=str, default="./checkpoints")

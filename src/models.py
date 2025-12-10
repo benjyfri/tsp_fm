@@ -231,38 +231,6 @@ class CanonicalMLPVectorField(nn.Module):
             output_size=self.n_points * self.input_dim
         )
 
-    def _get_canonical_rotation_optimized(self, x, epsilon=1e-8):
-        B, N, D = x.shape
-        magnitudes = torch.norm(x, dim=2)
-        max_mag_indices = torch.argmax(magnitudes, dim=1)
-        p_n = torch.gather(x, 1, max_mag_indices.view(B, 1, 1).expand(-1, -1, 2)).squeeze(1)
-
-        p_n_norm = torch.norm(p_n, dim=1, keepdim=True) + epsilon
-        px_norm = p_n[:, 0:1] / p_n_norm
-        py_norm = p_n[:, 1:2] / p_n_norm
-
-        cos_alpha = py_norm.view(-1)
-        sin_alpha = -px_norm.view(-1)
-
-        R1 = torch.zeros(B, 2, 2, device=x.device, dtype=x.dtype)
-        R1[:, 0, 0] = cos_alpha
-        R1[:, 0, 1] = -sin_alpha
-        R1[:, 1, 0] = sin_alpha
-        R1[:, 1, 1] = cos_alpha
-
-        x_rot = torch.bmm(x, R1)
-
-        dists = torch.norm(x - p_n.unsqueeze(1), dim=2)
-        dists.scatter_(1, max_mag_indices.unsqueeze(1), float('inf'))
-        closest_indices = torch.argmin(dists, dim=1)
-        p_x_rotated = torch.gather(x_rot, 1, closest_indices.view(B, 1, 1).expand(-1, -1, 2)).squeeze(1)
-
-        reflection_mask = torch.where(p_x_rotated[:, 0] < 0, -1.0, 1.0).to(x.dtype)
-        R2 = torch.eye(2, device=x.device, dtype=x.dtype).unsqueeze(0).repeat(B, 1, 1)
-        R2[:, 0, 0] = reflection_mask
-
-        return torch.bmm(R1, R2)
-
     def forward(self, x, t, geometry=None):
         B, N, D = x.shape
 
@@ -491,3 +459,217 @@ class CanonicalRegressor(nn.Module):
         y_global = torch.bmm(y_canonical, R.transpose(1, 2))
 
         return y_global
+
+
+import torch
+
+
+def get_spectral_canonicalization(x, sigma=1.0, epsilon=1e-8):
+    """
+    Robust Spectral Canonicalization using Normalized Laplacian.
+    Centers data, fixes sign ambiguity (skewness), and aligns frame (weighted centroid).
+    """
+    B, N, D = x.shape
+    device = x.device
+
+    # --- 0. Center the Point Cloud ---
+    # Critical: Alignment logic assumes the origin is the center of mass.
+    centroid = x.mean(dim=1, keepdim=True)  # (B, 1, D)
+    x_centered = x - centroid
+
+    # --- 1. Normalized Laplacian ---
+    # Use x_centered for distances (though identical to x, it's good practice)
+    dist_sq = torch.cdist(x_centered, x_centered, p=2) ** 2
+    W = torch.exp(-dist_sq / (sigma ** 2))
+
+    mask = torch.eye(N, device=device).unsqueeze(0).expand(B, N, N)
+    W = W * (1 - mask)
+
+    D_vec = W.sum(dim=2) + epsilon
+    D_inv_sqrt = torch.diag_embed(1.0 / torch.sqrt(D_vec))
+
+    I = torch.eye(N, device=device).unsqueeze(0).expand(B, N, N)
+    L_sym = I - torch.bmm(torch.bmm(D_inv_sqrt, W), D_inv_sqrt)
+
+    # --- 2. Eigen Decomposition ---
+    vals, vecs = torch.linalg.eigh(L_sym)
+
+    # Fiedler vector is index 1
+    fiedler_sym = vecs[:, :, 1]
+    fiedler = torch.bmm(D_inv_sqrt, fiedler_sym.unsqueeze(-1)).squeeze(-1)
+
+    # --- 3. ROBUST Sign Fix (Skewness) ---
+    # Use skewness (sum of cubes) to determine direction.
+    skew = torch.sum(fiedler ** 3, dim=1, keepdim=True)
+    sign_flip = torch.sign(skew)
+    sign_flip[sign_flip == 0] = 1.0
+
+    fiedler_fixed = fiedler * sign_flip
+
+    # --- 4. Sort ---
+    perm = torch.argsort(fiedler_fixed, dim=1)
+    inv_perm = torch.argsort(perm, dim=1)
+
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
+    # Note: We act on x_centered now!
+    x_ordered = x_centered[batch_idx, perm]
+
+    # --- 5. ROBUST Rotation Alignment (Weighted Centroid) ---
+    # Use linear weights to find the "Head" of the spectral snake
+    weights = torch.linspace(-1, 1, N, device=device).view(1, N, 1)
+
+    # Calculate weighted mean vector
+    # Since we centered at step 0, this vector represents pure orientation
+    weighted_direction = torch.sum(x_ordered * weights, dim=1)  # (B, 2)
+
+    norm = torch.norm(weighted_direction, dim=1, keepdim=True) + epsilon
+    u = weighted_direction / norm  # (B, 2)
+
+    # Align u to Y-axis (0, 1)
+    # u_x * sin + u_y * cos = 1 -> cos = u_y, sin = -u_x
+    cos_theta = u[:, 1:2]
+    sin_theta = -u[:, 0:1]
+
+    R1 = torch.stack([
+        torch.cat([cos_theta, -sin_theta], dim=1),
+        torch.cat([sin_theta, cos_theta], dim=1)
+    ], dim=1)
+
+    x_rot = torch.bmm(x_ordered, R1)
+
+    # --- 6. Reflection Alignment ---
+    # Check if the "upper half" (positive weights) leans Positive X or Negative X
+    upper_half_mask = (weights > 0).float()
+
+    # We check the X-coordinate of the weighted centroid of the upper half
+    upper_half_centroid_x = torch.sum(x_rot[..., 0:1] * upper_half_mask, dim=1)
+
+    # We want this to be Positive. If negative, flip X.
+    # Note: If centroid is -5, sign is -1. We want to flip, so we put -1 in matrix.
+    # If centroid is +5, sign is +1. We stay, so we put +1 in matrix.
+    ref_sign = torch.sign(upper_half_centroid_x).view(B, 1, 1)
+    ref_sign[ref_sign == 0] = 1.0
+
+    R2 = torch.eye(2, device=device, dtype=x.dtype).unsqueeze(0).expand(B, 2, 2).clone()
+    R2[:, 0, 0] = ref_sign.squeeze()
+
+    # Total Transform
+    R_total = torch.bmm(R1, R2)
+    x_canonical = torch.bmm(x_ordered, R_total)
+
+    return x_canonical, R_total, perm, inv_perm
+
+
+class SpectralCanonMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_points = config.num_points
+        self.input_dim = 2
+        self.t_dim = config.embed_dim // 4  # Time embedding dimension
+
+        # 1. Time Embedding (Gaussian Fourier)
+        self.time_mlp = nn.Sequential(
+            TimeEmbedding(self.t_dim),
+            nn.Linear(self.t_dim, self.t_dim),
+            nn.GELU()
+        )
+
+        # 2. Main MLP
+        # Input: Flattened Points (N*2) + Time Embedding
+        input_flat_dim = (self.n_points * 2) + self.t_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(input_flat_dim, config.embed_dim * 4),
+            nn.BatchNorm1d(config.embed_dim * 4),
+            nn.GELU(),
+            # ... deeper layers ...
+            nn.Linear(config.embed_dim * 4, self.n_points * 2)
+        )
+
+    def forward(self, x, t, geometry=None):
+        B, N, D = x.shape
+
+        # 1. Canonicalize
+        x_canon, R, perm, inv_perm = get_spectral_canonicalization(x)
+
+        # 2. Flatten Points
+        x_flat = x_canon.reshape(B, -1)
+
+        # 3. Embed Time
+        t_emb = self.time_mlp(t)  # (B, t_dim)
+
+        # 4. Concatenate
+        x_in = torch.cat([x_flat, t_emb], dim=1)
+
+        # 5. Predict
+        v_canon_flat = self.mlp(x_in)
+        v_canon = v_canon_flat.reshape(B, N, D)
+
+        # 6. Inverse Transform
+        v_ordered = torch.bmm(v_canon, R.transpose(1, 2))
+
+        batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, N)
+        v_global = torch.zeros_like(v_ordered)
+        v_global[batch_idx, perm] = v_ordered
+
+        if geometry is not None:
+            return geometry.to_tangent(v_global, x)
+        return v_global
+
+
+class SpectralCanonTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # 1. Input Projection
+        self.input_proj = nn.Linear(2, config.embed_dim)
+
+        # 2. Sequence Positional Embedding (Learned)
+        # "I am point #5 in the sorted list"
+        self.seq_pos_embed = nn.Parameter(torch.randn(1, config.num_points, config.embed_dim) * 0.02)
+
+        # 3. RoPE for TIME (Rotates based on diffusion time t)
+        head_dim = config.embed_dim // config.num_heads
+        self.rope_time = RotaryTimeEmbedding(head_dim)
+
+        # 4. Layers
+        self.layers = nn.ModuleList([
+            RoPETransformerBlock(config) for _ in range(config.num_layers)
+        ])
+
+        self.output_head = nn.Linear(config.embed_dim, 2)
+
+    def forward(self, x, t, geometry=None):
+        B, N, D = x.shape
+
+        # 1. Canonicalize
+        x_canon, R, perm, inv_perm = get_spectral_canonicalization(x)
+
+        # 2. Embed Features
+        h = self.input_proj(x_canon)  # (B, N, Dim)
+
+        # 3. Add Sequence Positional Information
+        # This tells the model: "This vector belongs to the point with rank i"
+        h = h + self.seq_pos_embed[:, :N, :]
+
+        # 4. Get Time Rotation
+        cos, sin = self.rope_time(t)
+
+        # 5. Transformer Blocks (with Time RoPE)
+        for layer in self.layers:
+            h = layer(h, cos, sin)
+
+        # 6. Output
+        v_canon = self.output_head(h)
+
+        # 7. Inverse Transform
+        v_ordered = torch.bmm(v_canon, R.transpose(1, 2))
+
+        batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, N)
+        v_global = torch.zeros_like(v_ordered)
+        v_global[batch_idx, perm] = v_ordered
+
+        if geometry is not None:
+            return geometry.to_tangent(v_global, x)
+        return v_global
