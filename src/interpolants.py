@@ -183,28 +183,75 @@ class LinearInterpolant(BaseInterpolant):
 class KendallSFMInterpolant(BaseInterpolant):
     """
     Stochastic Flow Matching on Kendall Shape Space (Hypersphere).
-
-    Assumptions:
-    1. x0 and x1 are ALREADY ALIGNED (centered, normalized, and rotated).
-    2. Uses geomstats for stable Exp/Log maps.
+    Implements robust, device-safe Exp/Log maps to avoid geomstats CUDA bugs.
     """
 
-    def __init__(self, geometry, g=0.1):
+    def __init__(self, geometry, g=0.005):
         self.geometry = geometry
         self.g = g  # Stochasticity scale
+
+    def _project_to_manifold(self, x):
+        """
+        Force x to be strictly on the PreShapeSpace manifold:
+        1. Centered (mean = 0)
+        2. Unit Norm (frobenius norm = 1)
+        """
+        # 1. Center
+        x_centered = x - torch.mean(x, dim=-2, keepdim=True)
+
+        # 2. Normalize
+        norm = torch.norm(x_centered, dim=(-2, -1), keepdim=True)
+        # Avoid division by zero
+        x_proj = x_centered / (norm + 1e-8)
+        return x_proj
+
+    def _log_map(self, x, y):
+        """
+        Logarithm map on the Hypersphere: Log_x(y)
+        Returns the tangent vector at x pointing towards y.
+        """
+        # Inner product (B, 1, 1)
+        inner = torch.sum(x * y, dim=[-2, -1], keepdim=True)
+        cos_theta = torch.clamp(inner, -1.0 + 1e-7, 1.0 - 1e-7)
+        theta = torch.acos(cos_theta)
+
+        # u = y - x * cos_theta (Projection of y onto tangent space of x)
+        u_raw = y - x * cos_theta
+
+        # Scale factor: theta / sin(theta)
+        sin_theta = torch.sqrt(1.0 - cos_theta ** 2)
+
+        scale = torch.where(
+            theta < 1e-4,
+            torch.ones_like(theta),
+            theta / (sin_theta + 1e-8)
+        )
+
+        return scale * u_raw
+
+    def _exp_map(self, x, v):
+        """
+        Exponential map on the Hypersphere: Exp_x(v)
+        """
+        v_norm = torch.norm(v, dim=[-2, -1], keepdim=True)
+
+        cos_norm = torch.cos(v_norm)
+        sin_norm = torch.sin(v_norm)
+
+        sinc_norm = torch.where(
+            v_norm < 1e-4,
+            torch.ones_like(v_norm),
+            sin_norm / (v_norm + 1e-8)
+        )
+
+        return x * cos_norm + v * sinc_norm
 
     def precompute(self, x0, x1):
         """
         Calculate the tangent vector from x0 to x1 ONCE.
-        This defines the 'mean' geodesic path.
         """
-        # geomstats log: log(point, base_point) -> vector at base_point
-        # We calculate the velocity vector at x0 pointing towards x1
-        v_x0_to_x1 = self.geometry.metric.log(x1, x0)
-
-        return {
-            'v_x0_to_x1': v_x0_to_x1
-        }
+        v_x0_to_x1 = self._log_map(x0, x1)
+        return {'v_x0_to_x1': v_x0_to_x1}
 
     def sample(self, x0, x1, v_x0_to_x1, device):
         """
@@ -212,50 +259,84 @@ class KendallSFMInterpolant(BaseInterpolant):
         """
         B = x0.shape[0]
 
-        # 1. Sample Time t
-        # CRITICAL: Clamp t to avoid division by zero at t=1.0
+        # 1. Sample Time t (Clamped)
         t = torch.rand(B, device=device).type_as(x0)
         t = torch.clamp(t, min=0.001, max=0.999)
-        t_view = t.view(B, 1, 1)  # (B, 1, 1)
+        t_view = t.view(B, 1, 1)
 
         # 2. Compute Mean Position mu_t (Deterministic Geodesic)
-        # mu_t = Exp_x0(t * v)
-        # We use the precomputed tangent vector v scaled by t
         tangent_vec_at_t = t_view * v_x0_to_x1
-        mu_t = self.geometry.metric.exp(tangent_vec_at_t, x0)
+        mu_t = self._exp_map(x0, tangent_vec_at_t)
 
         # 3. Add Noise (Stochastic Bridge)
-        # sigma_t = g * sqrt(t * (1-t))
         sigma_t = self.g * torch.sqrt(t * (1 - t))
         sigma_t_view = sigma_t.view(B, 1, 1)
 
         # Sample ambient Gaussian noise
         noise_ambient = torch.randn_like(mu_t)
 
-        # Project noise to the tangent space of mu_t
-        # This ensures the noise moves us ALONG the sphere, not off it
-        noise_tangent = self.geometry.space.to_tangent(noise_ambient, mu_t)
+        # CRITICAL: Ensure noise is centered (remove translation component)
+        noise_centered = noise_ambient - torch.mean(noise_ambient, dim=-2, keepdim=True)
 
-        # Compute noisy sample z_t
-        # z_t = Exp_mu_t(sigma_t * noise_tangent)
-        zt = self.geometry.metric.exp(sigma_t_view * noise_tangent, mu_t)
+        # Project centered noise to tangent space of mu_t (remove radial component)
+        # v_proj = v - <v, mu_t> * mu_t
+        proj_comp = torch.sum(noise_centered * mu_t, dim=[-2, -1], keepdim=True) * mu_t
+        noise_tangent = noise_centered - proj_comp
+
+        # Compute raw zt via exponential map
+        zt_raw = self._exp_map(mu_t, sigma_t_view * noise_tangent)
+
+        # CRITICAL FIX: Explicitly project zt back to manifold
+        # This fixes numerical drift (norm != 1 or mean != 0) that causes geomstats to crash
+        zt = self._project_to_manifold(zt_raw)
 
         # 4. Compute Conditional Vector Field u_t
-        # The vector field should point from z_t towards x1.
         # u_t = Log_zt(x1) / (1 - t)
 
-        # Vector at zt pointing to x1
-        direction_to_target = self.geometry.metric.log(x1, zt)
-
-        # Scale by time-to-go
+        direction_to_target = self._log_map(zt, x1)
         ut = direction_to_target / (1.0 - t_view)
 
         return t, zt, ut
 
 
-def get_interpolant(name, geometry, stochasticity_scale=0.1):
+class LinearSFMInterpolant(BaseInterpolant):
+    """
+    Stochastic Flow Matching (Brownian Bridge) in Euclidean Space.
+    Formula:
+      x_t = (1-t)x0 + t*x1 + g*sqrt(t(1-t))*noise
+      u_t = (x1 - x_t) / (1-t)
+    """
+
+    def __init__(self, g=0.005):
+        self.g = g
+
+    def sample(self, x0, x1, device):
+        B = x0.shape[0]
+        # Clamp t to prevent division by zero at t=1
+        t = torch.rand(B, device=device).type_as(x0)
+        t = torch.clamp(t, min=0.001, max=0.999)
+        t_view = t.view(B, 1, 1)
+
+        # 1. Deterministic Path (Mean)
+        mu_t = (1 - t_view) * x0 + t_view * x1
+
+        # 2. Add Brownian Bridge Noise
+        # sigma_t = g * sqrt(t * (1-t))
+        sigma_t = self.g * torch.sqrt(t * (1 - t))
+        sigma_t_view = sigma_t.view(B, 1, 1)
+
+        noise = torch.randn_like(x0)
+        xt = mu_t + sigma_t_view * noise
+
+        # 3. Conditional Vector Field (Targeting x1)
+        # u_t(x|x1) = (x1 - x) / (1 - t)
+        ut = (x1 - xt) / (1 - t_view)
+
+        return t, xt, ut
+
+def get_interpolant(name, geometry, stochasticity_scale=0.005):
     if name == 'kendall': return KendallInterpolant(geometry)
     if name == 'linear': return LinearInterpolant()
     if name == 'kendall_sfm': return KendallSFMInterpolant(geometry, g=stochasticity_scale)
-    # if name == 'angle': return AngleInterpolant()
+    if name == 'linear_sfm': return LinearSFMInterpolant(g=stochasticity_scale)
     raise ValueError(f"Unknown interpolant: {name}")

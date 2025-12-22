@@ -75,28 +75,29 @@ def evaluate(args):
     num_points = getattr(model_args, 'num_points', args.num_points)
 
     geo = None
-    if interpolant == 'kendall':
+    # if interpolant == 'kendall':
+    if 'kendall' in interpolant:
         geo = GeometryProvider(num_points)
         print(f"Initialized Kendall Shape Space Geometry (N={num_points}).")
 
-        # 3. Initialize Model
-        model_type = getattr(model_args, 'model_type', 'concat')
+    # 3. Initialize Model
+    model_type = getattr(model_args, 'model_type', 'concat')
 
-        if model_type == 'rope':
-            model = RoPEVectorFieldModel(model_args).to(device)
-        elif model_type == 'canonical_rope':
-            model = CanonicalRoPEVectorField(model_args).to(device)
-        elif model_type == 'canonical_mlp':
-            model = CanonicalMLPVectorField(model_args).to(device)
-        # --- NEW MODELS ---
-        elif model_type == 'canonical_regressor':
-            model = CanonicalRegressor(model_args).to(device)
-        elif model_type == 'spectral_mlp':
-            model = SpectralCanonMLP(model_args).to(device)
-        elif model_type == 'spectral_trans':
-            model = SpectralCanonTransformer(model_args).to(device)
-        else:
-            model = VectorFieldModel(model_args).to(device)
+    if model_type == 'rope':
+        model = RoPEVectorFieldModel(model_args).to(device)
+    elif model_type == 'canonical_rope':
+        model = CanonicalRoPEVectorField(model_args).to(device)
+    elif model_type == 'canonical_mlp':
+        model = CanonicalMLPVectorField(model_args).to(device)
+    # --- NEW MODELS ---
+    elif model_type == 'canonical_regressor':
+        model = CanonicalRegressor(model_args).to(device)
+    elif model_type == 'spectral_mlp':
+        model = SpectralCanonMLP(model_args).to(device)
+    elif model_type == 'spectral_trans':
+        model = SpectralCanonTransformer(model_args).to(device)
+    else:
+        model = VectorFieldModel(model_args).to(device)
 
     model.load_state_dict(state_dict)
     model.eval()
@@ -149,7 +150,7 @@ def evaluate(args):
 
         # B. Flow Match (Batched)
         with torch.no_grad():
-            final_configs = ode_solve_euler(model, batch_x0, geometry=geo, steps=4)
+            final_configs = ode_solve_euler(model, batch_x0, geometry=geo, steps=5)
             # final_configs = ode_solve_rk4_exp(model, batch_x0, geometry=geo, steps=100)
 
         # C. Reconstruct & Evaluate
@@ -282,7 +283,7 @@ if __name__ == "__main__":
     #                     default='/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/kendall_ROPE_02/best_model_best.pt')
 
     parser.add_argument('--model_path', type=str,
-                        default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/canonical_rope_06/best_model.pt")
+                        default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/spectral_MLP_17_1M_linear_sfm_01/best_model.pt")
     parser.add_argument('--test_data', type=str,
                         default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/processed_data_geom_test.pt')
 
