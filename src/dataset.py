@@ -16,22 +16,41 @@ def load_data(path, device, interpolant=None):
     except FileNotFoundError:
         raise FileNotFoundError(f"Could not find data at {path}")
 
-    x0_list = [torch.from_numpy(e['points']).float() for e in data]
-    x1_list = [torch.from_numpy(e['circle']).float() for e in data]
-    paths = [torch.from_numpy(e['path']).long() for e in data]
+    # --- Robust Data Conversion ---
+    # Works regardless of whether data was saved as numpy arrays or torch tensors
+    x0_list = [torch.as_tensor(e['points']).float() for e in data]
+    x1_list = [torch.as_tensor(e['circle']).float() for e in data]
+
+    # Handle paths (Long/Int64)
+    paths = [torch.as_tensor(e['path']).long() for e in data]
 
     x0 = torch.stack(x0_list)  # float32
     x1 = torch.stack(x1_list)  # float32
 
-    # --- RECOMMENDED FIX FOR MANIFOLD DRIFT ---
-    # Uncomment the lines below to force training data onto the sphere (Norm=1).
-    # This prevents the "Distribution Shift" between Training (High Norm) and Inference (Unit Norm).
-    # ------------------------------------------
-    # num_points = x0.shape[1]
-    # geo = GeometryProvider(num_points)
-    # x0 = geo.space.projection(x0)
-    # x1 = geo.space.projection(x1)
-    # ------------------------------------------
+    # Only normalize if we are working in Kendall Shape Space
+    # Check if 'kendall' is in the class name of the interpolant object
+    is_kendall = False
+    if interpolant is not None:
+        class_name = interpolant.__class__.__name__.lower()
+        is_kendall = 'kendall' in class_name
+
+    if is_kendall:
+        print(f"Kendall-type interpolant ({interpolant.__class__.__name__}) detected.")
+        print("Projecting data to Shape Space (Centering + Frobenius Norm=1)...")
+
+        def shape_normalize(x):
+            x_d = x.double()
+            # Centering: Subtract mean of points (B, N, 2)
+            x_centered = x_d - x_d.mean(dim=1, keepdim=True)
+            # Normalizing: Frobenius norm = 1 (B, 1, 1)
+            norm = torch.norm(x_centered, p='fro', dim=(1, 2), keepdim=True)
+            return (x_centered / (norm + 1e-10)).float()
+
+        x0 = shape_normalize(x0)
+        x1 = shape_normalize(x1)
+    else:
+        x0 = x0.float()
+        x1 = x1.float()
 
     # Let interpolant pre-compute if it wants to
     precomputed = None

@@ -42,7 +42,8 @@ def ode_solve_euler(model, x_start, geometry=None, steps=100):
     dt = 1.0 / steps
     x = x_start.clone()
     model.eval()
-    times = torch.linspace(0, 1, steps+1, device=x.device)
+    # --- FIX: Force times to match x dtype (e.g., float32) ---
+    times = torch.linspace(0, 1, steps + 1, device=x.device, dtype=x.dtype)
 
     with torch.no_grad():
         for i in range(steps):

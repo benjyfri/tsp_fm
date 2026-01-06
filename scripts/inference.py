@@ -6,7 +6,8 @@ import numpy as np
 import wandb
 from tqdm import tqdm
 from torch.utils.data import TensorDataset, DataLoader
-
+from torchdiffeq import odeint
+from src.utils import ode_solve_euler, reconstruct_tour, calculate_tour_length, ode_solve_rk4_exp, ode_solve_adaptive
 # --- FIX 0: Set Geomstats Backend ---
 os.environ['GEOMSTATS_BACKEND'] = 'pytorch'
 
@@ -20,14 +21,42 @@ from src.models import (
     RoPEVectorFieldModel,
     CanonicalMLPVectorField,
     CanonicalRoPEVectorField,
-    # --- NEW IMPORTS ---
     CanonicalRegressor,
     SpectralCanonMLP,
     SpectralCanonTransformer
 )
 from src.dataset import load_data
-from src.utils import ode_solve_euler, reconstruct_tour, calculate_tour_length, ode_solve_rk4_exp, ode_solve_adaptive
+from src.utils import reconstruct_tour, calculate_tour_length
 from src.geometry import GeometryProvider
+
+
+# --- BATCHED ODE SOLVER WRAPPER ---
+@torch.no_grad()
+def solve_flow(model, x0, geometry, steps=11, method='rk4', device='cuda'):
+    """
+    Uses torchdiffeq to solve the flow.
+    Returns the final configuration (t=1.0).
+    """
+
+    def ode_func(t, y):
+        # t is a scalar provided by odeint, we expand it to match batch size
+        t_batch = t.expand(y.shape[0]).to(device)
+        return model(y, t_batch, geometry=geometry)
+
+    t_span = torch.linspace(0., 1., steps=steps).to(device)
+
+    # options for fixed-step solvers like rk4 or euler
+    options = {'step_size': 1.0 / (steps - 1)} if method in ['rk4', 'euler'] else None
+
+    # traj shape: (steps, batch_size, num_points, 2)
+    traj = odeint(
+        ode_func,
+        x0,
+        t_span,
+        method=method,
+        options=options
+    )
+    return traj[-1]  # Return only the final state at t=1.0
 
 
 def get_edges(tour):
@@ -53,7 +82,7 @@ def evaluate(args):
     try:
         checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
     except TypeError:
-        checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(args.model_path, map_location=device)
 
     # Determine Model Configuration
     if isinstance(checkpoint, dict) and 'args' in checkpoint:
@@ -75,7 +104,6 @@ def evaluate(args):
     num_points = getattr(model_args, 'num_points', args.num_points)
 
     geo = None
-    # if interpolant == 'kendall':
     if 'kendall' in interpolant:
         geo = GeometryProvider(num_points)
         print(f"Initialized Kendall Shape Space Geometry (N={num_points}).")
@@ -89,7 +117,6 @@ def evaluate(args):
         model = CanonicalRoPEVectorField(model_args).to(device)
     elif model_type == 'canonical_mlp':
         model = CanonicalMLPVectorField(model_args).to(device)
-    # --- NEW MODELS ---
     elif model_type == 'canonical_regressor':
         model = CanonicalRegressor(model_args).to(device)
     elif model_type == 'spectral_mlp':
@@ -99,19 +126,36 @@ def evaluate(args):
     else:
         model = VectorFieldModel(model_args).to(device)
 
-    model.load_state_dict(state_dict)
+    # Load state dict
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k.replace("_orig_mod.", "")
+        new_state_dict[name] = v
+
+    model.load_state_dict(new_state_dict)
+
+    # --- FIX 4: FORCE FLOAT32 ---
+    # This fixes the "Float and Double" mismatch if checkpoint was saved as Double
+    model.float()
+
     model.eval()
 
     # 4. Load Data & Create DataLoader
     print(f"Loading test data from {args.test_data}...")
-    x0, _, gt_paths, _ = load_data(args.test_data, torch.device('cpu'))
 
-    # x0 = x0[:10000, :, :]
-    # gt_paths = gt_paths[:10000]
-    # Ensure float32
+    # Mock Interpolant to trigger normalization
+    class MockInterpolant:
+        pass
+
+    mock_interp = MockInterpolant()
+    mock_interp.__class__.__name__ = "KendallInterpolant" if 'kendall' in interpolant else "Linear"
+
+    x0, _, gt_paths, _ = load_data(args.test_data, torch.device('cpu'), interpolant=mock_interp)
+
     x0 = x0.to(dtype=torch.float32)
 
-    print(f"Creating DataLoader with batch_size={args.batch_size}, num_workers={args.num_workers}...")
+    print(f"Creating DataLoader with batch_size={args.batch_size}...")
     indices = torch.arange(len(x0))
     dataset = TensorDataset(x0, indices)
 
@@ -123,35 +167,38 @@ def evaluate(args):
         pin_memory=True if torch.cuda.is_available() else False
     )
 
-    print(f"Evaluating on {len(x0)} samples using '{interpolant}' interpolant...")
+    print(f"Evaluating on {len(x0)} samples...")
 
     # Metrics Containers
     optimality_gaps = []
-
-    # New Shape Metrics
     dists_output_input = []
     dists_output_gt = []
     dists_input_gt = []
-
     rel_dists_output_input = []
     rel_dists_output_gt = []
-
-    # New Structure Metrics
     edge_overlaps = []
     output_cohesion_ratios = []
-
     valid_reconstructions = 0
-
+    print(f"Amount of ODE solver steps: {args.steps}")
     # 5. Batched Inference Loop
     for batch_x0, batch_indices in tqdm(loader, desc="Batched Inference"):
 
-        # A. Move batch to GPU
         batch_x0 = batch_x0.to(device)
 
-        # B. Flow Match (Batched)
         with torch.no_grad():
-            final_configs = ode_solve_euler(model, batch_x0, geometry=geo, steps=5)
-            # final_configs = ode_solve_rk4_exp(model, batch_x0, geometry=geo, steps=100)
+            # final_configs = ode_solve_euler(model, batch_x0, geometry=geo, steps=args.steps)
+            final_configs = solve_flow(
+                model,
+                batch_x0,
+                geometry=geo,
+                steps=args.steps,
+                method=args.method,
+                device=device
+            )
+
+        # Project back to Manifold
+        if geo is not None:
+            final_configs = geo._project(final_configs)
 
         # C. Reconstruct & Evaluate
         final_configs_cpu = final_configs.cpu()
@@ -159,57 +206,52 @@ def evaluate(args):
 
         for i in range(len(batch_indices)):
             idx = batch_indices[i].item()
-            pred_config = final_configs_cpu[i]  # (N, 2)
-            original_cities = original_cities_cpu[i]  # (N, 2)
+            pred_config = final_configs_cpu[i]
+            original_cities = original_cities_cpu[i]
 
             # 1. Standard TSP Metrics
             pred_tour = reconstruct_tour(pred_config)
             pred_len = calculate_tour_length(original_cities, pred_tour)
 
-            # Check validity
             if len(set(pred_tour)) == len(original_cities):
                 valid_reconstructions += 1
 
-            # Ground truth lookup
             gt_path = gt_paths[idx]
             gt_len = calculate_tour_length(original_cities, gt_path)
 
             gap = (pred_len - gt_len) / gt_len
             optimality_gaps.append(gap * 100)
 
-            # 2. Structural Metrics (New)
+            # 2. Structural Metrics
             pred_edges = get_edges(pred_tour)
             gt_edges = get_edges(gt_path)
 
-            # Intersection count
             overlap_count = len(pred_edges.intersection(gt_edges))
             edge_overlaps.append((overlap_count / len(original_cities)) * 100)
 
-            # Output Cohesion (Distances in Output Space)
             if geo is not None:
-                # A. Mean distance of edges chosen by Model
+                # Cohesion
                 pred_dist_sum = 0
                 for u, v in pred_edges:
                     d = torch.norm(pred_config[u] - pred_config[v])
                     pred_dist_sum += d.item()
-                mean_pred_edge_dist = pred_dist_sum / len(pred_edges)
+                mean_pred_edge_dist = pred_dist_sum / (len(pred_edges) + 1e-8)
 
-                # B. Mean distance of edges chosen by GT
                 gt_dist_sum = 0
                 for u, v in gt_edges:
                     d = torch.norm(pred_config[u] - pred_config[v])
                     gt_dist_sum += d.item()
-                mean_gt_edge_dist = gt_dist_sum / len(gt_edges)
+                mean_gt_edge_dist = gt_dist_sum / (len(gt_edges) + 1e-8)
 
                 output_cohesion_ratios.append(mean_gt_edge_dist / (mean_pred_edge_dist + 1e-8))
 
-            # 3. Kendall Shape Space Metrics
-            if geo is not None:
+                # Shape Metrics
                 gt_config = original_cities[gt_path]
 
+                # geomstats distance
                 d_out_in = geo.distance(pred_config, original_cities)
                 d_out_gt = geo.distance(pred_config, gt_config)
-                d_in_gt = geo.distance(original_cities, gt_config)  # Scale
+                d_in_gt = geo.distance(original_cities, gt_config)
 
                 dists_output_input.append(d_out_in.item())
                 dists_output_gt.append(d_out_gt.item())
@@ -227,7 +269,7 @@ def evaluate(args):
     print(f"\n=== Results ===")
     print(f"Average Optimality Gap:  {mean_gap:.4f}%")
     print(f"Validity Rate:           {validity_rate:.2f}%")
-    print(f"GT Edge Overlap:         {mean_overlap:.2f}% (Edges matched with GT)")
+    print(f"GT Edge Overlap:         {mean_overlap:.2f}%")
 
     wandb_logs = {
         "test_gap_percentage": mean_gap,
@@ -236,35 +278,18 @@ def evaluate(args):
     }
 
     if geo is not None and len(dists_output_gt) > 0:
-        mean_dist_input = np.mean(dists_output_input)
         mean_dist_gt = np.mean(dists_output_gt)
-        mean_dist_baseline = np.mean(dists_input_gt)
-
-        # Calculate Means for Relative Metrics
-        mean_rel_output_input = np.mean(rel_dists_output_input)
         mean_rel_output_gt = np.mean(rel_dists_output_gt)
-
         mean_cohesion = np.mean(output_cohesion_ratios)
 
-        convergence_ratio = mean_dist_gt / (mean_dist_input + 1e-8)
-
-        print(f"\n--- Shape Space Metrics (Absolute) ---")
-        print(f"Dist (Input vs GT) [Scale]: {mean_dist_baseline:.4f}")
-        print(f"Dist (Out vs Input):        {mean_dist_input:.4f}")
+        print(f"\n--- Shape Space Metrics ---")
         print(f"Dist (Out vs GT):           {mean_dist_gt:.4f}")
-
-        print(f"\n--- Shape Space Metrics (Relative) ---")
-        print(f"Relative Dist (Out vs In):  {mean_rel_output_input:.4f}  (Normalized by baseline)")
-        print(f"Relative Dist (Out vs GT):  {mean_rel_output_gt:.4f}  (Normalized by baseline)")
-        print(f"Output Cohesion Ratio:      {mean_cohesion:.4f}      (1.0 = Perfect Structure)")
+        print(f"Relative Dist (Out vs GT):  {mean_rel_output_gt:.4f}")
+        print(f"Output Cohesion Ratio:      {mean_cohesion:.4f}")
 
         wandb_logs.update({
-            "kendall_dist_output_input": mean_dist_input,
             "kendall_dist_output_gt": mean_dist_gt,
-            "kendall_dist_baseline_scale": mean_dist_baseline,
-            "kendall_rel_dist_output_input": mean_rel_output_input,
             "kendall_rel_dist_output_gt": mean_rel_output_gt,
-            "kendall_convergence_ratio": convergence_ratio,
             "output_cohesion_ratio": mean_cohesion
         })
 
@@ -276,36 +301,30 @@ def evaluate(args):
 
 
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.float32)
     parser = argparse.ArgumentParser()
-    # Paths
-    # parser.add_argument('--model_path', type=str,
-    #                     default='/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/kendall_ROPE_02/best_model_best.pt')
 
     parser.add_argument('--model_path', type=str,
-                        default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/spectral_MLP_17_1M_linear_sfm_01/best_model.pt")
+                        default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/linear_trans_ADALN_01/best_model.pt")
     parser.add_argument('--test_data', type=str,
-                        default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/processed_data_geom_test.pt')
+                        default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/can_tsp50_test.pt')
 
-    # Batching & Hardware Args
-    parser.add_argument('--batch_size', type=int, default=2048, help="Number of samples to process at once on GPU")
-    parser.add_argument('--num_workers', type=int, default=4, help="Number of CPU workers for data loading")
+    # Batching & Hardware
+    parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--gpu_id', type=int, default=7)
 
     # Run Config
-    parser.add_argument('--interpolant', type=str, choices=['kendall', 'linear', 'angle'], default='kendall')
-    parser.add_argument('--gpu_id', type=int, default=4)
+    parser.add_argument('--interpolant', type=str, default='kendall')
     parser.add_argument('--use_wandb', action='store_true')
     parser.add_argument('--project_name', type=str, default="tsp-flow-matching")
 
-    # Fallback Args
-    parser.add_argument('--model_type', type=str, default='rope',
-                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope'])
+    # Model Override (optional)
+    parser.add_argument('--model_type', type=str, default='rope')
     parser.add_argument('--num_points', type=int, default=50)
-    parser.add_argument('--embed_dim', type=int, default=128)
-    parser.add_argument('--t_emb_dim', type=int, default=64)
-    parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument('--dropout', type=float, default=0.0)
+
+    # Solver
+    parser.add_argument('--method', type=str, default='rk4', choices=['euler', 'rk4'])
+    parser.add_argument('--steps', type=int, default=50)
 
     args = parser.parse_args()
     evaluate(args)

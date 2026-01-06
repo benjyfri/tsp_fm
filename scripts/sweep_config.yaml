@@ -4,39 +4,58 @@ metric:
     name: val_loss
     goal: minimize
 
-# Early termination to save resources
 early_terminate:
     type: hyperband
     min_iter: 5
 
 parameters:
-    # --- Architecture Selection ---
+    # --- Model Selection ---
     model_type:
-        value: canonical_rope
+        value: spectral_trans
     interpolant:
-        value: linear
+        value: kendall
 
     # --- Hardware ---
     gpu_id:
-        value: 0
+        value: 3
 
     # --- Hyperparameters ---
     lr:
         distribution: log_uniform_values
-        min: 0.00001
-        max: 0.001
-    batch_size:
-        values: [512]
+        min: 0.00005    # 5e-5 (Slightly lower floor for fine-tuning)
+        max: 0.001      # 1e-3 (CRITICAL CHANGE: Reduced from 0.005)
+
+    grad_clip_norm:
+        value: 1.0      # Recommendation: Fix this to 1.0 to save sweep runs.
+                        # There is rarely a significant performance difference between 1.0 and 2.0.
+
+    # NEW: Helps prevent overfitting
+    dropout:
+        values: [0.0, 0.1]
+
+    # NEW: profound impact on AdamW stability
+    weight_decay:
+        values: [1e-5, 1e-3, 0.01]
+
+    # Warmup
+    warmup_epochs:
+        value: 2
+
+    # --- Architecture ---
     embed_dim:
         values: [512]
 
-    # Keeps the argument for the script, but sets it to a single dummy value
-    # so the sweep doesn't generate duplicate runs.
     num_heads:
-        values: [8,16]
+        values: [8, 16]
 
     num_layers:
-        values: [6, 8, 16]
+        values: [12, 16]
+
+    stochasticity_scale:
+        value: 0.005
+
+    batch_size:
+        values: [1024]
 
     # --- Fixed Training settings ---
     checkpoint_freq:
@@ -49,7 +68,7 @@ command:
     - python
     - ${program}
     - "--train_data"
-    - "data/processed_data_geom_train.pt"
+    - "data/can_tsp50_train.pt"
     - "--val_data"
-    - "data/processed_data_geom_val.pt"
+    - "data/can_tsp50_val.pt"
     - ${args}

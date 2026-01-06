@@ -172,8 +172,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # Paths (Defaults match your context)
+    # parser.add_argument('--data_path', type=str,
+    #                     default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/processed_data_geom_val.pt')
     parser.add_argument('--data_path', type=str,
-                        default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/processed_data_geom_val.pt')
+                        default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/can_tsp50_val.pt')
 
     parser.add_argument('--sample_idx', type=int, default=0, help="Index of the sample to visualize")
     parser.add_argument('--num_frames', type=int, default=90, help="Number of frames in animation")

@@ -1,47 +1,65 @@
 #!/usr/bin/env python3
 """
-Revised train.py with support for Canonical models and SFM.
+Revised train.py - Optimized for L40S/Ampere GPUs.
+Fixes: Float64 poisoning, enables TF32, optimizes data casting.
 """
 
 import os
 
-# --- MUST set geomstats backend before any geomstats import ---
+# --- 1. Prevent Geomstats Poisoning ---
 os.environ['GEOMSTATS_BACKEND'] = 'pytorch'
-# ----------------------------------------------------------------
+# --------------------------------------
 
 import sys
 import argparse
 from pathlib import Path
 import math
 import time
-
 import numpy as np
 import torch
 import wandb
 from tqdm import tqdm
 
+# --- 2. CRITICAL OPTIMIZATION: Enable TensorFloat-32 ---
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# -----------------------------------------------------
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-# Import all model variants
 from src.geometry import GeometryProvider
 from src.interpolants import get_interpolant
 from src.models import (
-    VectorFieldModel,
-    RoPEVectorFieldModel,
-    CanonicalMLPVectorField,
-    CanonicalRoPEVectorField,
-    CanonicalRegressor,
+    VectorFieldModel, RoPEVectorFieldModel, CanonicalMLPVectorField,
+    CanonicalRoPEVectorField, CanonicalRegressor,
     SpectralCanonMLP,
     SpectralCanonTransformer
 )
 from src.dataset import load_data, get_loader
 
-try:
-    import geomstats.backend as gs
-except Exception:
-    gs = None
+
+def get_model(args, device):
+    """Factory for model creation with explicit Float32 cast."""
+    if args.model_type == 'rope':
+        model = RoPEVectorFieldModel(args)
+    elif args.model_type == 'canonical_rope':
+        model = CanonicalRoPEVectorField(args)
+    elif args.model_type == 'canonical_mlp':
+        model = CanonicalMLPVectorField(args)
+    elif args.model_type == 'canonical_regressor':
+        model = CanonicalRegressor(args)
+    elif args.model_type == 'spectral_mlp':
+        model = SpectralCanonMLP(args)
+    elif args.model_type == 'spectral_trans':
+        model = SpectralCanonTransformer(args)
+    else:
+        model = VectorFieldModel(args)
+
+    # CRITICAL: Force cast to float32 to override any geomstats defaults
+    return model.to(device).float()
 
 
 def save_checkpoint(path, model, optimizer=None, scheduler=None, epoch=None, args=None, best=False):
@@ -49,12 +67,9 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, epoch=None, arg
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
     }
-    if optimizer is not None:
-        payload['optimizer_state_dict'] = optimizer.state_dict()
-    if scheduler is not None:
-        payload['scheduler_state_dict'] = scheduler.state_dict()
-    if args is not None:
-        payload['args'] = vars(args)
+    if optimizer is not None: payload['optimizer_state_dict'] = optimizer.state_dict()
+    if scheduler is not None: payload['scheduler_state_dict'] = scheduler.state_dict()
+    if args is not None: payload['args'] = vars(args)
 
     torch.save(payload, path)
     if best:
@@ -62,54 +77,41 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, epoch=None, arg
         torch.save(payload, best_path)
 
 
-def get_model(args, device):
-    """Helper to instantiate the correct model based on args.model_type"""
-    if args.model_type == 'rope':
-        print("Initializing RoPE Vector Field Model...")
-        return RoPEVectorFieldModel(args).to(device)
-    elif args.model_type == 'canonical_rope':
-        print("Initializing Canonical RoPE Vector Field Model...")
-        return CanonicalRoPEVectorField(args).to(device)
-    elif args.model_type == 'canonical_mlp':
-        print("Initializing Canonical MLP Vector Field Model...")
-        return CanonicalMLPVectorField(args).to(device)
-    # --- NEW MODELS ---
-    elif args.model_type == 'canonical_regressor':
-        print("Initializing Canonical Regressor (Direct x0->x1)...")
-        return CanonicalRegressor(args).to(device)
-    elif args.model_type == 'spectral_mlp':
-        print("Initializing Spectral Canonical MLP...")
-        return SpectralCanonMLP(args).to(device)
-    elif args.model_type == 'spectral_trans':
-        print("Initializing Spectral Canonical Transformer...")
-        return SpectralCanonTransformer(args).to(device)
-    else:
-        print("Initializing Standard Concatenation Vector Field Model...")
-        return VectorFieldModel(args).to(device)
-
-
 def train(args):
+    # --- 3. CRITICAL OPTIMIZATION: Reset Global Dtype ---
+    torch.set_default_dtype(torch.float32)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if gs is not None:
-        try:
-            gs.random.seed(args.seed)
-        except Exception:
-            pass
 
-    # --- Compute Parameter Count for Run Name ---
-    # Instantiate temp model on CPU
+    # Setup WandB
+    # 1. Calculate parameter count first
     _temp_model = get_model(args, device='cpu')
-    num_params = sum(p.numel() for p in _temp_model.parameters())
-    params_m = num_params / 1e6
+    num_params = sum(p.numel() for p in _temp_model.parameters()) / 1e6
+    print(f'+++++++++++++++++++++++++++++++')
+    print(f'Num of parameters: {num_params}')
+    print(f'+++++++++++++++++++++++++++++++')
     del _temp_model
-    print(f"Num of Parameters in model: {params_m:.1f}M")
+
+    # 2. Construct dynamic run name if one isn't manually provided
     if args.run_name is None:
-        args.run_name = f"{args.model_type}-{args.interpolant}-D{args.embed_dim}-L{args.num_layers}-P{params_m:.1f}M"
+        # Format: Type_Params_Layers_Heads_Dim_LR
+        # Example: spectral_trans_2.5M_L12_H8_D512_lr1e-04
+        args.run_name = (
+            f"{args.model_type}"
+            f"_{num_params:.2f}M"  # Number of params (e.g. 12.50M)
+            f"_L{args.num_layers}"  # Layers
+            f"_H{args.num_heads}"  # Heads
+            f"_D{args.embed_dim}"  # Embed Dimension
+            f"_lr{args.lr:.0e}"  # Learning rate in scientific notation
+        )
 
+    # 3. Initialize WandB with the new name
     wandb.init(project=args.project_name, name=args.run_name, config=args)
-    config = wandb.config
 
+    # 4. Explicitly log param count to config so you can sort/filter by "num_params_M" in the Table UI
+    wandb.config.update({"num_params_M": num_params}, allow_val_change=True)
+    config = wandb.config
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
 
@@ -119,101 +121,94 @@ def train(args):
     # Path handling
     def resolve_path(path_str):
         p = Path(path_str)
-        if not p.is_absolute():
-            return Path(parent_dir) / p
-        return p
+        return p if p.is_absolute() else Path(parent_dir) / p
 
-    train_path = resolve_path(config.train_data)
-    val_path = resolve_path(config.val_data)
     save_dir = resolve_path(config.save_dir) / config.run_name
     os.makedirs(save_dir, exist_ok=True)
 
     # Geometry & Data
     geo = GeometryProvider(config.num_points)
+    interpolant = get_interpolant(config.interpolant, geo, stochasticity_scale=config.stochasticity_scale)
 
-    # Pass stochasticity scale to get_interpolant
-    interpolant = get_interpolant(
-        config.interpolant,
-        geo,
-        stochasticity_scale=config.stochasticity_scale
-    )
-
+    print("Loading data...")
     try:
-        # Load data WITH interpolant for pre-computation
-        x0, x1, _, precomputed_train = load_data(
-            str(train_path), 'cpu', interpolant=interpolant
-        )
-        x0_val, x1_val, _, precomputed_val = load_data(
-            str(val_path), 'cpu', interpolant=interpolant
-        )
+        x0, x1, _, precomputed_train = load_data(str(resolve_path(config.train_data)), 'cpu', interpolant=interpolant)
+        x0_val, x1_val, _, precomputed_val = load_data(str(resolve_path(config.val_data)), 'cpu',
+                                                       interpolant=interpolant)
     except FileNotFoundError as e:
         print(f"\nCRITICAL ERROR: {e}")
         sys.exit(1)
 
-    # Tune num_workers to your machine; 4 is a good starting point.
-    train_loader = get_loader(x0, x1, precomputed_train,
-                              batch_size=config.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True)
-    val_loader = get_loader(x0_val, x1_val, precomputed_val,
-                            batch_size=config.batch_size, shuffle=False,
-                            num_workers=4, pin_memory=True)
+    # --- 4. OPTIMIZATION: Increase Workers ---
+    train_loader = get_loader(x0, x1, precomputed_train, batch_size=config.batch_size, shuffle=True, num_workers=8,
+                              pin_memory=True)
+    val_loader = get_loader(x0_val, x1_val, precomputed_val, batch_size=config.batch_size, shuffle=False, num_workers=4,
+                            pin_memory=True)
 
-    # Instantiate Model
+    # Model Setup
     model = get_model(config, device)
+    model = model.float()  # Double-check cast
+
+    # --- 5. OPTIMIZATION: Compile Model (PyTorch 2.0+) ---
+    # This fuses kernels for RoPE and Attention
+    print("Compiling model...")
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+    except Exception as e:
+        print(f"Could not compile model: {e}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     eta_min = config.lr * config.eta_min_factor
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs, eta_min=eta_min
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=eta_min)
 
     best_val = float('inf')
-
-    # Pass geometry if using Kendall interpolant or its SFM variant
     use_geo = geo if 'kendall' in config.interpolant else None
 
-    warmup_steps = int(config.warmup_epochs)
-
-    print("\nStarting training")
+    print("\nStarting training (High Performance Mode)")
     for epoch in range(1, config.epochs + 1):
         model.train()
         epoch_train_loss = 0.0
         num_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}", ncols=100)
-
-        # Simple Linear Warmup
-        if warmup_steps > 0 and epoch <= warmup_steps:
-            lr_mult = float(epoch) / float(max(1, warmup_steps))
-            for pg in optimizer.param_groups:
-                pg['lr'] = config.lr * lr_mult
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}", ncols=120)
 
         for batch in pbar:
-            # Unpack batch - handle both with/without precomputed data
+            # --- 6. OPTIMIZATION: Explicit Casting in Loop ---
             if precomputed_train is not None:
-                # First 3 are always x0, x1, theta (theta is inside precomputed usually, check load_data return)
-                # Actually Dataset returns (x0, x1, *precomputed_tuple)
                 b_x0, b_x1 = batch[0], batch[1]
-                precomputed_batch = batch[2:]
+                # Cast precomputed tensors to float32 on the fly
+                precomputed_batch = tuple(t.to(device, dtype=torch.float32, non_blocking=True) for t in batch[2:])
             else:
                 b_x0, b_x1 = batch
                 precomputed_batch = ()
 
-            # Move to device
-            b_x0 = b_x0.to(device, non_blocking=True)
-            b_x1 = b_x1.to(device, non_blocking=True)
-            precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
+            # Cast inputs
+            b_x0 = b_x0.to(device, dtype=torch.float32, non_blocking=True)
+            b_x1 = b_x1.to(device, dtype=torch.float32, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # Slightly faster than zero_grad()
 
-            sample_args = (b_x0, b_x1) + precomputed_batch
-
-            t, xt, ut = interpolant.sample(*sample_args, device=device)
+            # Sample (Ensure interpolant returns floats)
+            t, xt, ut = interpolant.sample(b_x0, b_x1, *precomputed_batch, device=device)
+            xt, t, ut = xt.float(), t.float(), ut.float()
 
             # Forward
             vt = model(xt, t, geometry=use_geo)
             loss = torch.mean((vt - ut) ** 2)
+
+            # --- ADD THIS BLOCK ---
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n❌ CRITICAL: Loss is {loss.item()}. Stopping run immediately.")
+
+                # Optional: Mark run as failed in WandB explicitly
+                wandb.run.summary["status"] = "crashed_nan"
+                wandb.finish(exit_code=1)
+
+                # Exit with error code 1 so the Sweep Agent knows it failed
+                sys.exit(1)
+            # ----------------------
+
             loss.backward()
 
             if config.grad_clip_norm > 0:
@@ -223,7 +218,7 @@ def train(args):
 
             epoch_train_loss += loss.item()
             num_batches += 1
-            pbar.set_postfix({"loss": f"{loss.item():.5f}"})
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_train = epoch_train_loss / max(1, num_batches)
 
@@ -235,18 +230,16 @@ def train(args):
             for batch in val_loader:
                 if precomputed_val is not None:
                     b_x0, b_x1 = batch[0], batch[1]
-                    precomputed_batch = batch[2:]
+                    precomputed_batch = tuple(t.to(device, dtype=torch.float32, non_blocking=True) for t in batch[2:])
                 else:
                     b_x0, b_x1 = batch
                     precomputed_batch = ()
 
-                b_x0 = b_x0.to(device, non_blocking=True)
-                b_x1 = b_x1.to(device, non_blocking=True)
-                precomputed_batch = tuple(t.to(device, non_blocking=True) for t in precomputed_batch)
+                b_x0 = b_x0.to(device, dtype=torch.float32, non_blocking=True)
+                b_x1 = b_x1.to(device, dtype=torch.float32, non_blocking=True)
 
-                sample_args = (b_x0, b_x1) + precomputed_batch
-
-                t, xt, ut = interpolant.sample(*sample_args, device=device)
+                t, xt, ut = interpolant.sample(b_x0, b_x1, *precomputed_batch, device=device)
+                xt, t, ut = xt.float(), t.float(), ut.float()
 
                 vt = model(xt, t, geometry=use_geo)
                 val_loss_accum += torch.mean((vt - ut) ** 2).item()
@@ -256,60 +249,41 @@ def train(args):
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
-        # History & Logging
+        # Logging
         print(f"Epoch {epoch}: Train {avg_train:.6f} | Val {avg_val:.6f} | LR {current_lr:.3e}")
-        wandb.log({
-            "epoch": epoch,
-            "train_loss": avg_train,
-            "val_loss": avg_val,
-            "lr": current_lr
-        }, step=epoch)
+        wandb.log({"epoch": epoch, "train_loss": avg_train, "val_loss": avg_val, "lr": current_lr})
 
         # Checkpointing
         if config.checkpoint_freq > 0 and (epoch % config.checkpoint_freq == 0):
-            save_checkpoint(os.path.join(save_dir, "last_checkpoint.pt"),
-                            model, optimizer, scheduler, epoch, args)
+            save_checkpoint(os.path.join(save_dir, "last_checkpoint.pt"), model, optimizer, scheduler, epoch, args)
 
         if config.checkpoint_freq > 0 and (avg_val < best_val):
             best_val = avg_val
-            save_checkpoint(os.path.join(save_dir, "best_model.pt"),
-                            model, optimizer, scheduler, epoch, args, best=True)
+            save_checkpoint(os.path.join(save_dir, "best_model.pt"), model, optimizer, scheduler, epoch, args,
+                            best=True)
             print(f"  -> New best model saved (val {best_val:.6f})")
 
-    # Final Save
-    save_checkpoint(os.path.join(save_dir, "final_model.pt"),
-                    model, optimizer, scheduler, config.epochs, args)
-
+    save_checkpoint(os.path.join(save_dir, "final_model.pt"), model, optimizer, scheduler, config.epochs, args)
     print(f"Training complete. Best validation loss: {best_val:.6f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train flow matching model")
 
-    parser.add_argument('--project_name', type=str, default="tsp-flow-matching")
+    # Args from your original script
+    parser.add_argument('--project_name', type=str, default="tsp_FM")
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--train_data', type=str, required=True)
     parser.add_argument('--val_data', type=str, required=True)
-
-    # Updated choices including kendall_sfm
     parser.add_argument('--interpolant', type=str,
-                        choices=['kendall', 'linear', 'angle', 'kendall_sfm', 'withguard_kendall'],
+                        choices=['kendall', 'linear', 'angle', 'kendall_sfm', 'withguard_kendall', 'linear_sfm'],
                         default='kendall')
-
-    # New argument for stochasticity
-    parser.add_argument('--stochasticity_scale', type=float, default=0.1,
-                        help="Scale of noise (g) for stochastic flow matching")
-
-    # Updated Model Choices
+    parser.add_argument('--stochasticity_scale', type=float, default=0.1)
     parser.add_argument('--model_type', type=str, default='rope',
-                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope',
-                                 'canonical_regressor', 'spectral_mlp', 'spectral_trans'],
-                        help="Choose model architecture")
-
+                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope', 'canonical_regressor',
+                                 'spectral_mlp', 'spectral_trans'])
     parser.add_argument('--save_dir', type=str, default="./checkpoints")
     parser.add_argument('--checkpoint_freq', type=int, default=10)
-
-    # Hyperparams
     parser.add_argument('--num_points', type=int, default=50)
     parser.add_argument('--embed_dim', type=int, default=256)
     parser.add_argument('--t_emb_dim', type=int, default=128)
@@ -320,7 +294,10 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--eta_min_factor', type=float, default=1e-3)
     parser.add_argument('--warmup_epochs', type=int, default=0)
-    parser.add_argument('--grad_clip_norm', type=float, default=5.0)
+
+    # --- 7. OPTIMIZATION: Disable Gradient Clipping by Default ---
+    # Clipping forces a CPU sync. Only enable if training is unstable.
+    parser.add_argument('--grad_clip_norm', type=float, default=0.0)
 
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=256)
@@ -328,6 +305,8 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42)
 
     args = parser.parse_args()
+
+    # Force float32 in args just in case
     torch.set_default_dtype(torch.float32)
 
     train(args)

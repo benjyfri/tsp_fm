@@ -1,6 +1,6 @@
 import os
 
-# Must set backend before importing geomstats
+# Set backend to pytorch
 os.environ['GEOMSTATS_BACKEND'] = 'pytorch'
 
 import torch
@@ -17,8 +17,13 @@ class GeometryProvider:
         self.metric = self.space.metric
 
     def to_tangent(self, vector, base_point):
-        """Project a vector to the tangent space at base_point."""
-        return self.space.to_tangent(vector, base_point)
+        """
+        Project a vector to the tangent space at base_point.
+        HANDLES PRECISION: Casts to Double for Geomstats, returns Float for Model.
+        """
+        # Geomstats requires Double (float64) for stability and internal consistency.
+        # We explicitly cast inputs to double, perform the op, and cast back to float32.
+        return self.space.to_tangent(vector.double(), base_point.double()).float()
 
     def _project(self, x):
         """
@@ -64,11 +69,6 @@ class GeometryProvider:
             R = U @ torch.diag(diag) @ Vh
 
         # 5. Apply Rotation
-        # source (N, 2) @ R (2, 2) -> (N, 2)
-        # Note: We treat points as row vectors, so we multiply R on the right?
-        # Standard: y = R x. If x is column.
-        # Here x is (N, 2). So x_new = x @ R.T?
-        # Let's check dims: (N, 2) x (2, 2).
         return torch.matmul(source, R.transpose(-2, -1))
 
     def distance(self, point_a, point_b):
@@ -76,18 +76,22 @@ class GeometryProvider:
         Compute the robust Kendall Shape Space distance.
         Handling Centering -> Normalizing -> Aligning -> Geodesic
         """
+        # Ensure inputs are Double for precision in distance calculation
+        point_a = point_a.double()
+        point_b = point_b.double()
+
         # 1. Project both to Pre-Shape Space (Center & Normalize)
-        # This handles the fact that 'original_cities' has arbitrary scale
         a_proj = self._project(point_a)
         b_proj = self._project(point_b)
 
         # 2. Align point_b to point_a (Remove Rotation)
-        # We do this manually to avoid attribute errors in older geomstats versions
         b_aligned = self._align(b_proj, a_proj)
 
         # 3. Compute distance on the Hypersphere (Pre-shape metric)
-        # Since we manually aligned them, this is now the Kendall distance
-        return self.metric.dist(a_proj, b_aligned)
+        dist = self.metric.dist(a_proj, b_aligned)
+
+        # Return as float32
+        return dist.float()
 
     @property
     def dim(self):
