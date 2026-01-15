@@ -322,14 +322,14 @@ def main():
         description="Preprocess TSP data using geomstats (Forces CCW Orientation)"
     )
     # Input Config
-    parser.add_argument('--infile', type=str, default="../tsp50_val_concorde.txt")
+    parser.add_argument('--infile', type=str, default="../tsp50_test_concorde.txt")
     parser.add_argument('--num_points', type=int, default=50)
     parser.add_argument('--num_workers', type=int, default=32)
 
     # Real Dataset Creation Options
     parser.add_argument('--create_real_dataset', action='store_true',
                         help="If set, processes the entire file into one .pt file (ignores demo sizes).")
-    parser.add_argument('--real_out_path', type=str, default='processed_data_geom_val.pt',
+    parser.add_argument('--real_out_path', type=str, default='processed_data_geom_test.pt',
                         help="Output path when creating the real dataset.")
 
     # Demo Slice Options (Used if --create_real_dataset is NOT set)

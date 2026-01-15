@@ -1,0 +1,69 @@
+program: train_egnn.py
+method: bayes
+metric:
+  name: val_loss
+  goal: minimize
+
+# Early stopping helps save GPU hours on bad runs
+early_terminate:
+  type: hyperband
+  min_iter: 5
+  eta: 2
+
+parameters:
+  # --- Project ---
+  project_name:
+    value: tsp_FM_EGNN_Sweep
+
+  # --- Hardware ---
+  gpu_id:
+    value: 7
+
+  # --- EGNN Specific Hyperparameters ---
+  # k: Crucial for graph connectivity vs. over-smoothing
+  k:
+    values: [10, 15, 20, 25, 30]
+
+  # weight_temp: Controls the "sharpness" of the velocity gating (tanh)
+  # Lower (1.0) = binary-like gating, Higher (20.0) = linear-like
+  weight_temp:
+    values: [1.0, 5.0, 10.0, 20.0]
+
+  # Architecture
+  embed_dim:
+    values: [64, 128, 256]
+
+  num_layers:
+    values: [4, 6, 8, 10]
+
+  # --- Optimization ---
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001   # 1e-4
+    max: 0.001    # 1e-3
+
+  weight_decay:
+    values: [0.0, 1e-5, 1e-4]
+
+  grad_clip_norm:
+    values: [0.0, 1.0, 5.0]
+
+  # --- Training Defaults ---
+  batch_size:
+    value: 1024      # Smaller batch size often generalizes better for GNNs
+  epochs:
+    value: 20       # EGNNs converge faster than Transformers per epoch
+  checkpoint_freq:
+    value: 0        # Don't save intermediate checkpoints during sweeps to save space
+
+# Pass arguments to your script.
+# CRITICAL: Ensure the data paths point to your actual .pt files
+command:
+  - ${env}
+  - python
+  - ${program}
+  - "--train_data"
+  - "../data/tsp50_train.pt"  # <--- UPDATE THIS PATH
+  - "--val_data"
+  - "../data/tsp50_test.pt"    # <--- UPDATE THIS PATH
+  - ${args}

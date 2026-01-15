@@ -29,9 +29,10 @@ with open(args.config, 'r') as file:
 
 # 2. Initialize the sweep
 # Login if needed (wandb.login())
+project_name = sweep_configuration["parameters"]["project_name"]["value"]
 sweep_id = wandb.sweep(
     sweep=sweep_configuration,
-    project="tsp_FM"
+    project=project_name
 )
 
 print(f"Sweep initiated. ID: {sweep_id}")
@@ -39,4 +40,4 @@ print(f"Sweep initiated. ID: {sweep_id}")
 # 3. Run the agent automatically
 # 'count' limits the number of runs. Remove it to run forever.
 print("Starting wandb agent to run the sweep...")
-wandb.agent(sweep_id, project="tsp_FM", count=30)
+wandb.agent(sweep_id, project=project_name, count=30)

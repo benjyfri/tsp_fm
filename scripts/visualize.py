@@ -31,7 +31,8 @@ try:
         CanonicalMLPVectorField,
         CanonicalRegressor,
         SpectralCanonMLP,
-        SpectralCanonTransformer
+        SpectralCanonTransformer,
+        EquivariantDiffTransformer
     )
     from src.geometry import GeometryProvider
     from src.dataset import load_data
@@ -421,8 +422,8 @@ def main():
     parser.add_argument('--model_path', type=str,
                         default=r"/home/benjamin.fri/PycharmProjects/tsp_fm/checkpoints/linear_trans_ADALN_01/best_model.pt")
     parser.add_argument('--input_file', type=str,
-                        default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/can_tsp50_val.pt')
-    parser.add_argument('--gpu_id', type=int, default=7)
+                        default='/home/benjamin.fri/PycharmProjects/tsp_fm/data/can_tsp50_rope_val.pt')
+    parser.add_argument('--gpu_id', type=int, default=4)
     parser.add_argument('--sample_idx', type=int, default=0)
     parser.add_argument('--output_dir', type=str, default="visualizations")
     parser.add_argument('--num_points', type=int, default=50)
@@ -472,6 +473,8 @@ def main():
         model = SpectralCanonMLP(model_args).to(device)
     elif model_type == 'spectral_trans':
         model = SpectralCanonTransformer(model_args).to(device)
+    elif model_type == "equivariant_transformer":
+        model = EquivariantDiffTransformer(model_args).to(device)
     else:
         model = VectorFieldModel(model_args).to(device)
 
@@ -488,7 +491,7 @@ def main():
     model.eval()
 
     print(f"Loading data from {args.input_file}...")
-    x0_all, x1_all, gt_paths_all, _ = load_data(args.input_file, device)
+    x0_all, x1_all, gt_paths_all, static_signals, precomputed = load_data(args.input_file, device)
 
     if args.sample_idx >= len(x0_all):
         sys.exit(1)

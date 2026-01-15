@@ -210,16 +210,16 @@ def process_batch(points_batch, paths_batch, calc_rope=True, sigma_kernel=1.0, e
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--infile', type=str, default="../tsp50_val_concorde.txt")
-    parser.add_argument('--batch_size', type=int, default=512)
-    parser.add_argument('--num_points', type=int, default=50)
-    parser.add_argument('--out', type=str, default='can_tsp50_rope_val.pt')
-    ### NEW: Argument to toggle RoPE signal calculation
+    parser.add_argument('--infile', type=str, default="../tsp100_test_concorde.txt")
+    parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--num_points', type=int, default=100)
+    parser.add_argument('--out', type=str, default='can_tsp100_test.pt')
     parser.add_argument('--no_rope', action='store_true', help="Disable calculation of static RoPE signals")
     args = parser.parse_args()
 
-    device = "cuda:4" if torch.cuda.is_available() else "cpu"
+    device = "cuda:3" if torch.cuda.is_available() else "cpu"
 
+    # --- Loading Data ---
     all_points, all_paths = [], []
     with open(args.infile, 'r') as f:
         for line in f:
@@ -232,36 +232,48 @@ def main():
 
     p_tensor = torch.from_numpy(np.array(all_points))
     s_tensor = torch.from_numpy(np.array(all_paths))
-    dataset = []
 
-    ### NEW: Determine if we run calculation based on args
+    # --- Storage Lists (Store Batches, not Items) ---
+    store_x0, store_x1, store_perm, store_edges, store_path, store_signals = [], [], [], [], [], []
+
     calc_rope = not args.no_rope
     print(f"Processing data... (Calc RoPE Signals: {calc_rope})")
 
+    # --- Processing Loop ---
     for i in tqdm(range(0, len(p_tensor), args.batch_size)):
         b_p = p_tensor[i: i + args.batch_size]
         b_s = s_tensor[i: i + args.batch_size]
         if len(b_p) == 0: break
 
-        ### CHANGED: Passing calc_rope arg and unpacking updated return values
         x0, x1, perms, edges, paths_ccw, static_signals = process_batch(
             b_p, b_s, calc_rope=calc_rope, device=device
         )
 
-        for b in range(x0.shape[0]):
-            entry = {
-                'points': x0[b],
-                'circle': x1[b],
-                'spectral_perm': perms[b],
-                'edge_lengths': edges[b],
-                'path': paths_ccw[b]
-            }
-            ### NEW: Add signals to dict only if they exist
-            if static_signals is not None:
-                entry['static_signals'] = static_signals[b]  # (N, 4)
-            dataset.append(entry)
+        # Append WHOLE BATCHES to lists (CPU tensors)
+        store_x0.append(x0)
+        store_x1.append(x1)
+        store_perm.append(perms)
+        store_edges.append(edges)
+        store_path.append(paths_ccw)
+        if static_signals is not None:
+            store_signals.append(static_signals)
 
-    torch.save(dataset, args.out)
+    # --- Fast Collate & Save ---
+    print("Collating tensors...")
+    final_dict = {
+        'points': torch.cat(store_x0, dim=0),
+        'circle': torch.cat(store_x1, dim=0),
+        'spectral_perm': torch.cat(store_perm, dim=0),
+        'edge_lengths': torch.cat(store_edges, dim=0),
+        'path': torch.cat(store_path, dim=0),
+    }
+
+    if len(store_signals) > 0:
+        final_dict['static_signals'] = torch.cat(store_signals, dim=0)
+
+    print(f"Saving to {args.out}...")
+    torch.save(final_dict, args.out)
+    print("Done.")
 
 
 if __name__ == '__main__':

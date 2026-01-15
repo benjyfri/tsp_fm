@@ -36,7 +36,8 @@ from src.models import (
     VectorFieldModel, RoPEVectorFieldModel, CanonicalMLPVectorField,
     CanonicalRoPEVectorField, CanonicalRegressor,
     SpectralCanonMLP,
-    SpectralCanonTransformer
+    SpectralCanonTransformer,
+    EquivariantDiffTransformer
 )
 from src.dataset import load_data, get_loader
 
@@ -55,6 +56,8 @@ def get_model(args, device):
         model = SpectralCanonMLP(args)
     elif args.model_type == 'spectral_trans':
         model = SpectralCanonTransformer(args)
+    elif args.model_type == 'equivariant_transformer':
+        model = EquivariantDiffTransformer(args)
     else:
         model = VectorFieldModel(args)
 
@@ -132,18 +135,21 @@ def train(args):
 
     print("Loading data...")
     try:
-        x0, x1, _, precomputed_train = load_data(str(resolve_path(config.train_data)), 'cpu', interpolant=interpolant)
-        x0_val, x1_val, _, precomputed_val = load_data(str(resolve_path(config.val_data)), 'cpu',
-                                                       interpolant=interpolant)
+        ### CHANGED: Unpack 5 values now (x0, x1, paths, signals, precomputed)
+        # We ignore paths (index 2) using '_'
+        x0, x1, _, signals_train, pre_train = load_data(str(resolve_path(config.train_data)), 'cpu',
+                                                        interpolant=interpolant)
+        x0_val, x1_val, _, signals_val, pre_val = load_data(str(resolve_path(config.val_data)), 'cpu',
+                                                            interpolant=interpolant)
     except FileNotFoundError as e:
         print(f"\nCRITICAL ERROR: {e}")
         sys.exit(1)
 
-    # --- 4. OPTIMIZATION: Increase Workers ---
-    train_loader = get_loader(x0, x1, precomputed_train, batch_size=config.batch_size, shuffle=True, num_workers=8,
-                              pin_memory=True)
-    val_loader = get_loader(x0_val, x1_val, precomputed_val, batch_size=config.batch_size, shuffle=False, num_workers=4,
-                            pin_memory=True)
+    ### CHANGED: Pass signals to get_loader
+    train_loader = get_loader(x0, x1, signals_train, pre_train, batch_size=config.batch_size, shuffle=True,
+                              num_workers=0, pin_memory=True)
+    val_loader = get_loader(x0_val, x1_val, signals_val, pre_val, batch_size=config.batch_size, shuffle=False,
+                            num_workers=0, pin_memory=True)
 
     # Model Setup
     model = get_model(config, device)
@@ -153,7 +159,7 @@ def train(args):
     # This fuses kernels for RoPE and Attention
     print("Compiling model...")
     try:
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model, mode='default')
     except Exception as e:
         print(f"Could not compile model: {e}")
 
@@ -174,14 +180,23 @@ def train(args):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}", ncols=120)
 
         for batch in pbar:
-            # --- 6. OPTIMIZATION: Explicit Casting in Loop ---
-            if precomputed_train is not None:
-                b_x0, b_x1 = batch[0], batch[1]
-                # Cast precomputed tensors to float32 on the fly
-                precomputed_batch = tuple(t.to(device, dtype=torch.float32, non_blocking=True) for t in batch[2:])
-            else:
-                b_x0, b_x1 = batch
-                precomputed_batch = ()
+            ### NEW: Robust Batch Unpacking Logic
+            # 1. Base components (Always first 2)
+            b_x0, b_x1 = batch[0], batch[1]
+            idx_counter = 2
+
+            # 2. Check for Static Signals
+            b_signals = None
+            if signals_train is not None:
+                b_signals = batch[idx_counter].to(device, non_blocking=True)
+                idx_counter += 1
+
+            # 3. Check for Precomputed Interpolant Data
+            precomputed_batch = ()
+            if pre_train is not None:
+                # All remaining items are precomputed
+                precomputed_batch = tuple(
+                    t.to(device, dtype=torch.float32, non_blocking=True) for t in batch[idx_counter:])
 
             # Cast inputs
             b_x0 = b_x0.to(device, dtype=torch.float32, non_blocking=True)
@@ -193,8 +208,14 @@ def train(args):
             t, xt, ut = interpolant.sample(b_x0, b_x1, *precomputed_batch, device=device)
             xt, t, ut = xt.float(), t.float(), ut.float()
 
-            # Forward
-            vt = model(xt, t, geometry=use_geo)
+            ### CHANGED: Conditional Forward Pass
+            if args.model_type == 'equivariant_transformer':
+                if b_signals is None:
+                    raise ValueError("Model requires static signals but dataset didn't provide them.")
+                vt = model(xt, t, static_signals=b_signals, geometry=use_geo)
+            else:
+                # Standard models don't take static_signals
+                vt = model(xt, t, geometry=use_geo)
             loss = torch.mean((vt - ut) ** 2)
 
             # --- ADD THIS BLOCK ---
@@ -228,12 +249,19 @@ def train(args):
         val_batches = 0
         with torch.no_grad():
             for batch in val_loader:
-                if precomputed_val is not None:
-                    b_x0, b_x1 = batch[0], batch[1]
-                    precomputed_batch = tuple(t.to(device, dtype=torch.float32, non_blocking=True) for t in batch[2:])
-                else:
-                    b_x0, b_x1 = batch
-                    precomputed_batch = ()
+                # (Repeat unpacking logic for validation)
+                b_x0, b_x1 = batch[0], batch[1]
+                idx_counter = 2
+
+                b_signals = None
+                if signals_val is not None:
+                    b_signals = batch[idx_counter].to(device, non_blocking=True)
+                    idx_counter += 1
+
+                precomputed_batch = ()
+                if pre_val is not None:
+                    precomputed_batch = tuple(
+                        t.to(device, dtype=torch.float32, non_blocking=True) for t in batch[idx_counter:])
 
                 b_x0 = b_x0.to(device, dtype=torch.float32, non_blocking=True)
                 b_x1 = b_x1.to(device, dtype=torch.float32, non_blocking=True)
@@ -241,7 +269,12 @@ def train(args):
                 t, xt, ut = interpolant.sample(b_x0, b_x1, *precomputed_batch, device=device)
                 xt, t, ut = xt.float(), t.float(), ut.float()
 
-                vt = model(xt, t, geometry=use_geo)
+                ### CHANGED: Conditional Forward Pass (Validation)
+                if args.model_type == 'equivariant_transformer':
+                    vt = model(xt, t, static_signals=b_signals, geometry=use_geo)
+                else:
+                    vt = model(xt, t, geometry=use_geo)
+
                 val_loss_accum += torch.mean((vt - ut) ** 2).item()
                 val_batches += 1
 
@@ -279,9 +312,11 @@ if __name__ == "__main__":
                         choices=['kendall', 'linear', 'angle', 'kendall_sfm', 'withguard_kendall', 'linear_sfm'],
                         default='kendall')
     parser.add_argument('--stochasticity_scale', type=float, default=0.1)
+    ### CHANGED: added equivariant_transformer to choices
     parser.add_argument('--model_type', type=str, default='rope',
-                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope', 'canonical_regressor',
-                                 'spectral_mlp', 'spectral_trans'])
+                        choices=['concat', 'rope', 'canonical_mlp', 'canonical_rope',
+                                 'canonical_regressor', 'spectral_mlp', 'spectral_trans',
+                                 'equivariant_transformer'])
     parser.add_argument('--save_dir', type=str, default="./checkpoints")
     parser.add_argument('--checkpoint_freq', type=int, default=10)
     parser.add_argument('--num_points', type=int, default=50)
@@ -293,7 +328,6 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--eta_min_factor', type=float, default=1e-3)
-    parser.add_argument('--warmup_epochs', type=int, default=0)
 
     # --- 7. OPTIMIZATION: Disable Gradient Clipping by Default ---
     # Clipping forces a CPU sync. Only enable if training is unstable.

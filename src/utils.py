@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+from sympy.codegen.ast import none
 
 from torchdiffeq import odeint
 
@@ -38,7 +38,7 @@ def ode_solve_adaptive(model, x_start, geometry, method='dopri5', rtol=1e-5, ato
     return geometry.space.projection(x_traj[-1])
 
 # In src/utils.py
-def ode_solve_euler(model, x_start, geometry=None, steps=100):
+def ode_solve_euler(model, x_start, geometry=None, signals=None, steps=100):
     dt = 1.0 / steps
     x = x_start.clone()
     model.eval()
@@ -50,7 +50,13 @@ def ode_solve_euler(model, x_start, geometry=None, steps=100):
             t = times[i].repeat(x.shape[0])
 
             # Pass geometry to model for tangent projection
-            v = model(x, t, geometry=geometry)
+            if signals is not None:
+                v = model(x, t, static_signals=signals, geometry=geometry)
+
+            else:
+                # Standard models don't take static_signals
+                v = model(x, t, geometry=geometry)
+            # v = model(x, t, geometry=geometry)
             x = x + v * dt
 
             # If on Kendall manifold, project back to sphere
@@ -128,7 +134,10 @@ def reconstruct_tour(final_points):
     reconstruct the tour based on angular ordering.
     """
     # Calculate angles relative to center (0,0)
-    angles = torch.atan2(final_points[:, 1], final_points[:, 0])
+    # center points by their centroid before computing angles
+    centroid = final_points.mean(dim=0, keepdim=True)
+    centered = final_points - centroid
+    angles = torch.atan2(centered[:, 1], centered[:, 0])
     # Sort indices by angle
     tour_order = torch.argsort(angles)
     return tour_order
