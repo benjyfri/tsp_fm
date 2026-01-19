@@ -210,14 +210,14 @@ def process_batch(points_batch, paths_batch, calc_rope=True, sigma_kernel=1.0, e
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--infile', type=str, default="../tsp100_test_concorde.txt")
+    parser.add_argument('--infile', type=str, default="../tsp1000_test_concorde.txt")
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--num_points', type=int, default=100)
-    parser.add_argument('--out', type=str, default='can_tsp100_test.pt')
+    parser.add_argument('--out', type=str, default='can_tsp1000_test.pt')
     parser.add_argument('--no_rope', action='store_true', help="Disable calculation of static RoPE signals")
     args = parser.parse_args()
 
-    device = "cuda:3" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # --- Loading Data ---
     all_points, all_paths = [], []
