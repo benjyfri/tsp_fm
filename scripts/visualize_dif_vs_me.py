@@ -10,11 +10,14 @@ import matplotlib.patheffects as pe
 # ==========================================
 def set_style():
     plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'DejaVu Sans'],
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman', 'DejaVu Serif'],
         'font.size': 14,
-        'axes.titlesize': 30,
-        'axes.titleweight': 'bold',
+        # --- FIX: FORCE PURE BLACK & HEAVY WEIGHT ---
+        'axes.titlesize': 24,
+        'axes.titleweight': 'heavy',  # Thicker than 'bold'
+        'axes.titlecolor': '#000000',  # Force HEX pure black (no grey)
+        'text.color': '#000000',
         'figure.dpi': 300,
         'lines.linewidth': 1.5,
         'axes.spines.top': False,
@@ -75,8 +78,9 @@ def create_paradigm_figure(sample, output_file="paradigm_shift_refined.png"):
     node_colors = cmap(node_ranks / N)
 
     # Setup 2x1 Plot
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=True)
-
+    # fig, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    plt.subplots_adjust(wspace=-0.05)
     # ==========================================
     # LEFT: OLD PARADIGM
     # ==========================================
@@ -142,8 +146,8 @@ def create_paradigm_figure(sample, output_file="paradigm_shift_refined.png"):
         ax.add_patch(arrow)
 
         # Ghost Node (Original position)
-        ax.scatter(start[0], start[1], c=node_colors[i].reshape(1, -1),
-                   s=200, alpha=0.3, edgecolors='none', zorder=2)
+        ax.scatter(start[0], start[1], c=node_colors[i].reshape(1, -1), edgecolors='black', linewidth=1.0,
+                   s=200, alpha=0.3,zorder=2)
 
         # Target Node (Manifold position)
         # --- CHANGE 5: Refined Node Geometry ---
@@ -151,7 +155,7 @@ def create_paradigm_figure(sample, output_file="paradigm_shift_refined.png"):
                    s=200, alpha=1.0, edgecolors='white', linewidth=1.5, zorder=20)
 
     # Sync limits
-    padding = 0.05
+    padding = 0.03
     all_coords = np.concatenate([X, X_target])
 
     # Use max extent for both to keep scale identical
